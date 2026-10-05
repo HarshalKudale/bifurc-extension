@@ -1,33 +1,68 @@
 /**
  * Bifurc Companion — Background Service Worker
  *
- * Manages:
- * 1. Proxy toggle (route traffic through Bifurc's proxy)
- * 2. WebSocket connection to companion server
- * 3. Context menus for DevTools network panel
+ * The extension is a proxy switch for the Bifurc desktop app:
+ * 1. It finds the app's companion server (a WebSocket on loopback) and opens
+ *    an RPC session with it.
+ * 2. It asks the engine which port its forward proxy listens on.
+ * 3. The toggle routes browser traffic to that port, or leaves it direct.
+ *
+ * Finding the companion server: the app binds the first free port at or above
+ * a base port (9271 unless changed in the app's Settings → Ports). So the
+ * extension tries the base port and the next 10 above it, lowest first. If
+ * none answers, the popup offers the port to the user.
  *
  * IMPORTANT — proxy activation rule:
- *   The proxy is applied ONLY when the user toggle is ON **and** the companion
- *   server is connected. If either condition is false we clear the proxy
- *   settings so the browser keeps its normal direct passthrough. Routing
- *   through a proxy whose companion server is down would black-hole traffic,
- *   so the safe default is always "direct".
+ *   The proxy is applied ONLY when the toggle is ON, the engine is connected
+ *   and its forward proxy is running. In every other case the proxy settings
+ *   are cleared so the browser keeps its normal direct passthrough. Routing to
+ *   a port nothing listens on would black-hole traffic.
  */
 
-// ── Default config ────────────────────────────────────────────────────────────
+// ── Constants (kept in step with the engine) ──────────────────────────────────
+
+const HOST = "127.0.0.1";
+/** The app's default companion port (Settings → Ports). */
+const DEFAULT_BASE_PORT = 9271;
+/** How many ports above the base are tried before giving up. */
+const SCAN_AHEAD = 10;
+/** `PROTOCOL_VERSION` in `protocol-rust/src/version.rs`. */
+const PROTOCOL_VERSION = "1.0.0";
+/** One of the engine's `CLIENT_NAMES`. */
+const CLIENT_NAME = "bifurc-extension";
+
+const PROBE_TIMEOUT_MS = 800;
+const HELLO_TIMEOUT_MS = 3000;
+const RPC_TIMEOUT_MS = 5000;
+/** Also what keeps the service worker alive while a session is open. */
+const STATUS_POLL_MS = 5000;
+const MAX_RETRY_DELAY_MS = 15000;
+
+const EVENTS = ["event.settings.changed", "event.server.error", "event.engine.stopping"];
 
 const DEFAULTS = {
     proxyEnabled: false,
-    proxyPort: 80,
-    companionPort: 9271,
+    basePort: DEFAULT_BASE_PORT,
+    // The companion port of the last session, tried first on the next search.
+    lastPort: null,
 };
 
 // ── State ─────────────────────────────────────────────────────────────────────
 
-let ws = null;
-let wsReconnectTimer = null;
-let wsReconnectDelay = 1000;
-const MAX_RECONNECT_DELAY = 30000;
+let ws = null;              // the socket of the established session
+let companionPort = null;   // the port that session is on
+let engineVersion = null;
+let forward = { running: false, port: 0, error: null };
+
+let searching = false;      // a search is in flight
+let notFound = false;       // the last search finished without finding the app
+let discoverSeq = 0;        // a newer search supersedes an older one
+let retryTimer = null;
+let retryDelay = 1000;
+let pollTimer = null;
+
+let rpcSeq = 0;
+const pending = new Map();  // rpc id -> { resolve, reject, timer }
 
 // Monotonic guard so a slow/racing applyProxy() can never clobber a newer one.
 let proxyApplySeq = 0;
@@ -35,22 +70,27 @@ let proxyApplySeq = 0;
 // null until the first successful apply in this service-worker lifetime.
 let appliedProxyKey = null;
 // Synchronous mirror of "Chrome is routing regular traffic through our proxy".
-// webRequest listeners are sync, so they cannot await getProxyState().
+// webRequest listeners are sync, so they cannot await getState().
 let proxyRouted = false;
-
 
 // ── Storage helpers ───────────────────────────────────────────────────────────
 
+function isPort(value) {
+    return Number.isInteger(value) && value >= 1 && value <= 65535;
+}
+
 async function getConfig() {
-    const result = await chrome.storage.local.get(DEFAULTS);
-    return result;
+    const config = await chrome.storage.local.get(DEFAULTS);
+    if (!isPort(config.basePort)) config.basePort = DEFAULT_BASE_PORT;
+    if (!isPort(config.lastPort)) config.lastPort = null;
+    return config;
 }
 
 async function setConfig(patch) {
     await chrome.storage.local.set(patch);
 }
 
-// ── Connection state ──────────────────────────────────────────────────────────
+// ── Resolved state ────────────────────────────────────────────────────────────
 
 function isConnected() {
     return !!(ws && ws.readyState === WebSocket.OPEN);
@@ -60,325 +100,371 @@ function isConnected() {
  * Resolved, UI-facing state. `proxyActive` is the single source of truth for
  * whether traffic is actually being routed through the proxy right now.
  */
-async function getProxyState() {
-    const { proxyEnabled, proxyPort, companionPort } = await getConfig();
+async function getState() {
+    const { proxyEnabled, basePort } = await getConfig();
     const connected = isConnected();
+    const forwardRunning = connected && forward.running && isPort(forward.port);
     return {
         connected,
+        searching,
+        notFound: !connected && notFound,
+        basePort,
+        scanAhead: SCAN_AHEAD,
+        companionPort: connected ? companionPort : null,
+        engineVersion: connected ? engineVersion : null,
         proxyEnabled: !!proxyEnabled,
-        proxyActive: !!proxyEnabled && connected,
-        proxyPort,
-        companionPort,
+        proxyActive: !!proxyEnabled && forwardRunning,
+        forwardRunning,
+        forwardPort: forwardRunning ? forward.port : null,
+        forwardError: connected ? forward.error : null,
     };
+}
+
+function broadcastState(state) {
+    const emit = (s) => {
+        chrome.runtime
+            .sendMessage({ type: "state", ...s })
+            .catch(() => { /* no listeners open — fine */ });
+    };
+    if (state) emit(state);
+    else getState().then(emit).catch(() => { });
 }
 
 // ── Proxy management ──────────────────────────────────────────────────────────
 
 function buildPacScript(port) {
-    return `function FindProxyForURL(url, host) { return "PROXY 127.0.0.1:${port}"; }`;
+    return `function FindProxyForURL(url, host) { return "PROXY ${HOST}:${port}"; }`;
 }
 
 /**
  * Reconcile Chrome's proxy settings with the current desired state.
  *
- *   proxyEnabled && connected  ->  install PAC script pointing at the proxy
- *   otherwise                  ->  clear proxy settings (direct passthrough)
+ *   toggle on && forward proxy reachable  ->  PAC script pointing at its port
+ *   otherwise                             ->  clear proxy settings (direct)
  */
 async function applyProxy() {
     const seq = ++proxyApplySeq;
-    const state = await getProxyState();
+    const state = await getState();
 
     // A newer call has already started — let it win.
     if (seq !== proxyApplySeq) return state;
 
-    // Identity of the desired proxy config. Reset to null whenever the service
-    // worker restarts, which is what we want: Chrome may still hold settings
-    // from a previous lifetime, so the first apply must always run.
-    const desiredKey = state.proxyActive ? `pac:${state.proxyPort}` : "direct";
+    // Reset to null whenever the service worker restarts, which is what we
+    // want: Chrome may still hold settings from a previous lifetime, so the
+    // first apply must always run.
+    const desiredKey = state.proxyActive ? `pac:${state.forwardPort}` : "direct";
 
     // Keep the synchronous mirror in step before any early return, so the
     // webRequest listener sees the truth even on the skip path.
     proxyRouted = state.proxyActive;
 
-    if (desiredKey === appliedProxyKey) {
-        broadcastState(state);
-        return state;
-    }
-
-    try {
-        if (state.proxyActive) {
-            await chrome.proxy.settings.set({
-                value: {
-                    mode: "pac_script",
-                    pacScript: { data: buildPacScript(state.proxyPort) },
-                },
-                scope: "regular",
-            });
-        } else {
-            await chrome.proxy.settings.clear({ scope: "regular" });
+    if (desiredKey !== appliedProxyKey) {
+        try {
+            if (state.proxyActive) {
+                await chrome.proxy.settings.set({
+                    value: {
+                        mode: "pac_script",
+                        pacScript: { data: buildPacScript(state.forwardPort) },
+                    },
+                    scope: "regular",
+                });
+            } else {
+                await chrome.proxy.settings.clear({ scope: "regular" });
+            }
+            appliedProxyKey = desiredKey;
+            console.log(`[Bifurc] Proxy ${state.proxyActive ? `ON -> ${HOST}:${state.forwardPort}` : "OFF (direct)"}`);
+        } catch (err) {
+            console.error("[Bifurc] Failed to apply proxy settings:", err);
         }
-        appliedProxyKey = desiredKey;
-        console.log(
-            `[Bifurc] Proxy ${state.proxyActive ? "ACTIVE" : "BYPASSED (direct)"}` +
-            ` — toggle=${state.proxyEnabled} connected=${state.connected}` +
-            (state.proxyActive ? ` port=${state.proxyPort}` : "")
-        );
-    } catch (err) {
-        console.error("[Bifurc] Failed to apply proxy settings:", err);
     }
 
     broadcastState(state);
     return state;
 }
 
-// ── WebSocket connection to companion server ──────────────────────────────────
+// ── Finding the companion server ──────────────────────────────────────────────
 
-let connectInFlight = false;
-
-function connectWebSocket() {
-    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
-        return;
+/** The ports to try, in order: the last one that worked, then upward from the base. */
+function candidatePorts(basePort, lastPort) {
+    const ports = [];
+    if (isPort(lastPort)) ports.push(lastPort);
+    for (let offset = 0; offset <= SCAN_AHEAD; offset++) {
+        const port = basePort + offset;
+        if (port > 65535) break;
+        if (port !== lastPort) ports.push(port);
     }
-    if (connectInFlight) return;
-    connectInFlight = true;
-
-    getConfig().then(({ companionPort }) => {
-        connectInFlight = false;
-
-        const url = `ws://127.0.0.1:${companionPort}`;
-        let socket;
-
-        try {
-            socket = new WebSocket(url);
-        } catch (e) {
-            scheduleReconnect();
-            return;
-        }
-
-        ws = socket;
-
-        socket.onopen = () => {
-            if (ws !== socket) return; // superseded by a newer socket
-            console.log("[Bifurc] Connected to companion server");
-            wsReconnectDelay = 1000; // reset backoff
-            // Connection is up — the proxy may now be allowed to activate.
-            applyProxy();
-        };
-
-        socket.onclose = () => {
-            // Ignore events from a socket we already replaced, otherwise we
-            // would null out the live connection and orphan it.
-            if (ws !== socket) return;
-            ws = null;
-            // Connection is down — immediately fall back to direct passthrough
-            // even if the user's toggle is still on.
-            applyProxy();
-            scheduleReconnect();
-        };
-
-        socket.onerror = () => {
-            // onerror always fires before onclose
-        };
-
-        socket.onmessage = (event) => {
-            if (ws !== socket) return;
-            console.log("[Bifurc] WebSocket message received:", event.data);
-            try {
-                const msg = JSON.parse(event.data);
-                console.log("[Background] Parsed message:", msg);
-                // Forward response to any waiting popup/devtools
-                chrome.runtime.sendMessage({ type: "ws:response", payload: msg }).catch((err) => {
-                    console.error("[Background] Error forwarding response:", err);
-                });
-            } catch (err) {
-                console.error("[Background] Error parsing WebSocket message:", err);
-            }
-        };
-    }).catch(() => {
-        connectInFlight = false;
-        scheduleReconnect();
-    });
-}
-
-function scheduleReconnect() {
-    if (wsReconnectTimer) clearTimeout(wsReconnectTimer);
-    wsReconnectTimer = setTimeout(() => {
-        wsReconnectTimer = null;
-        connectWebSocket();
-    }, wsReconnectDelay);
-    wsReconnectDelay = Math.min(wsReconnectDelay * 2, MAX_RECONNECT_DELAY);
+    return ports;
 }
 
 /**
- * Push the current connection + proxy state to popup / devtools listeners.
- * Kept on the "companion:status" message type for backward compatibility.
+ * Whether `port` answers like the engine's WebSocket endpoint. A plain HTTP
+ * request to it gets `426 Upgrade Required` with `upgrade: websocket`
+ * (`refuse_plain_http` in the engine's `transport/ws.rs`). This is a cheap
+ * filter — Chrome deliberately slows down bursts of WebSocket attempts — and
+ * the handshake that follows is what confirms it.
  */
-function broadcastState(state) {
-    const emit = (s) => {
-        chrome.runtime
-            .sendMessage({
-                type: "companion:status",
-                status: s.connected ? "connected" : "disconnected",
-                ...s,
-            })
-            .catch(() => { /* no listeners open — fine */ });
-    };
-
-    if (state) emit(state);
-    else getProxyState().then(emit).catch(() => { });
-}
-
-function sendToCompanion(message) {
-    if (ws && ws.readyState === WebSocket.OPEN) {
-        console.log("[Bifurc] Sending to companion:", message.action);
-        ws.send(JSON.stringify(message));
-        return true;
+async function looksLikeEngine(port) {
+    try {
+        const response = await fetch(`http://${HOST}:${port}/`, {
+            cache: "no-store",
+            credentials: "omit",
+            signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+        });
+        return response.status === 426 &&
+            (response.headers.get("upgrade") || "").toLowerCase() === "websocket";
+    } catch {
+        return false;
     }
-    console.warn("[Bifurc] Cannot send to companion - WebSocket not connected");
-    return false;
 }
 
-// ── Context menus ─────────────────────────────────────────────────────────────
+/**
+ * Open a session on `port`: connect, then `hello`. Resolves true once the
+ * engine has accepted the handshake and this socket is the live session.
+ */
+function openSession(port, token) {
+    return new Promise((resolve) => {
+        let socket;
+        try {
+            socket = new WebSocket(`ws://${HOST}:${port}`);
+        } catch {
+            resolve(false);
+            return;
+        }
 
-chrome.runtime.onInstalled.addListener(() => {
-    // Remove existing menus to avoid duplicates on update
-    chrome.contextMenus.removeAll(() => {
-        chrome.contextMenus.create({
-            id: "bifurc-mock",
-            title: "Mock this request [Bifurc]",
-            contexts: ["link"],
-        });
+        let settled = false;
+        const helloId = `hello-${++rpcSeq}`;
+        const fail = () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            try { socket.close(); } catch { /* already closed */ }
+            resolve(false);
+        };
+        const timer = setTimeout(fail, HELLO_TIMEOUT_MS);
 
-        chrome.contextMenus.create({
-            id: "bifurc-request",
-            title: "Add to Requests [Bifurc]",
-            contexts: ["link"],
-        });
+        socket.onopen = () => {
+            socket.send(JSON.stringify({
+                id: helloId,
+                action: "hello",
+                payload: {
+                    protocolVersion: PROTOCOL_VERSION,
+                    clientName: CLIENT_NAME,
+                    clientVersion: chrome.runtime.getManifest().version,
+                },
+            }));
+        };
+
+        socket.onmessage = (event) => {
+            let frame;
+            try { frame = JSON.parse(event.data); } catch { return; }
+
+            if (settled) {
+                if (ws === socket) handleFrame(frame);
+                return;
+            }
+            if (frame.id !== helloId) return;
+            if (!frame.ok || token !== discoverSeq || isConnected()) {
+                if (!frame.ok) console.warn(`[Bifurc] Port ${port} refused the handshake:`, frame.error);
+                fail();
+                return;
+            }
+
+            settled = true;
+            clearTimeout(timer);
+            ws = socket;
+            companionPort = port;
+            engineVersion = (frame.data && frame.data.engineVersion) || null;
+            console.log(`[Bifurc] Connected to the desktop app on port ${port}`);
+            resolve(true);
+        };
+
+        socket.onerror = () => { /* onclose always follows */ };
+
+        socket.onclose = () => {
+            if (!settled) {
+                fail();
+                return;
+            }
+            if (ws === socket) sessionEnded();
+        };
     });
-});
+}
 
-// ── Message handler (from popup and devtools) ─────────────────────────────────
+async function sessionStarted(port) {
+    notFound = false;
+    retryDelay = 1000;
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = null;
+    await setConfig({ lastPort: port });
+
+    rpc("subscribe", { events: EVENTS }).catch(() => { /* status is polled anyway */ });
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = setInterval(refreshForward, STATUS_POLL_MS);
+    await refreshForward();
+}
+
+function sessionEnded() {
+    ws = null;
+    companionPort = null;
+    engineVersion = null;
+    forward = { running: false, port: 0, error: null };
+    if (pollTimer) clearInterval(pollTimer);
+    pollTimer = null;
+    for (const [id, call] of pending) {
+        clearTimeout(call.timer);
+        call.reject(new Error("the connection closed"));
+        pending.delete(id);
+    }
+    console.log("[Bifurc] Disconnected from the desktop app");
+    // Fall back to direct passthrough at once, even if the toggle is still on.
+    applyProxy();
+    scheduleRetry();
+}
+
+/** Look for the desktop app on the candidate ports and connect to it. */
+async function discover() {
+    if (isConnected()) return;
+    const token = ++discoverSeq;
+    searching = true;
+    broadcastState();
+
+    const { basePort, lastPort } = await getConfig();
+    const ports = candidatePorts(basePort, lastPort);
+    let found = null;
+
+    const answers = await Promise.all(ports.map(looksLikeEngine));
+    if (token !== discoverSeq) return;
+    for (let i = 0; i < ports.length && found === null; i++) {
+        if (!answers[i]) continue;
+        if (await openSession(ports[i], token)) found = ports[i];
+        if (token !== discoverSeq) return;
+    }
+
+    searching = false;
+    if (found === null) {
+        notFound = true;
+        scheduleRetry();
+        await applyProxy();
+        return;
+    }
+    await sessionStarted(found);
+}
+
+function scheduleRetry() {
+    if (retryTimer) clearTimeout(retryTimer);
+    retryTimer = setTimeout(() => {
+        retryTimer = null;
+        if (!isConnected() && !searching) discover();
+    }, retryDelay);
+    retryDelay = Math.min(retryDelay * 2, MAX_RETRY_DELAY_MS);
+}
+
+/** Drop the session (if any) and search again. */
+function searchAgain() {
+    retryDelay = 1000;
+    if (ws) {
+        const socket = ws;
+        sessionEnded();
+        try { socket.close(); } catch { /* already closed */ }
+    }
+    return discover();
+}
+
+// ── RPC over the session ──────────────────────────────────────────────────────
+
+function rpc(action, payload) {
+    return new Promise((resolve, reject) => {
+        if (!isConnected()) {
+            reject(new Error("not connected"));
+            return;
+        }
+        const id = `ext-${++rpcSeq}`;
+        const timer = setTimeout(() => {
+            pending.delete(id);
+            reject(new Error(`"${action}" timed out`));
+        }, RPC_TIMEOUT_MS);
+        pending.set(id, { resolve, reject, timer });
+        ws.send(JSON.stringify({ id, action, payload: payload || {} }));
+    });
+}
+
+function handleFrame(frame) {
+    if (typeof frame.event === "string") {
+        // Settings, a listener failure, a restart: all can move the forward proxy.
+        refreshForward();
+        return;
+    }
+    const call = pending.get(frame.id);
+    if (!call) return;
+    pending.delete(frame.id);
+    clearTimeout(call.timer);
+    if (frame.ok) call.resolve(frame.data);
+    else call.reject(new Error((frame.error && frame.error.message) || "the engine refused the request"));
+}
+
+/** Ask the engine where its forward proxy listens, and whether it is up. */
+async function refreshForward() {
+    if (!isConnected()) return;
+    const socket = ws;
+    try {
+        const status = await rpc("server.status", {});
+        if (ws !== socket) return;
+        forward = {
+            running: !!status.running,
+            port: Number(status.port) || 0,
+            error: typeof status.error === "string" ? status.error : null,
+        };
+    } catch (err) {
+        if (ws !== socket) return;
+        // An engine that stopped answering is as good as gone.
+        console.warn("[Bifurc] Lost the desktop app:", err.message);
+        sessionEnded();
+        try { socket.close(); } catch { /* already closed */ }
+        return;
+    }
+    await applyProxy();
+}
+
+// ── Message handler (popup and the proxy help page) ───────────────────────────
 
 async function handleMessage(message) {
-    console.log("[Background] Received message:", message.type, message);
     switch (message.type) {
         case "get:status":
-            return await getProxyState();
+            return await getState();
 
         case "proxy:toggle":
             await setConfig({ proxyEnabled: !!message.enabled });
             return await applyProxy();
 
-        case "proxy:setPort":
-            await setConfig({ proxyPort: message.port });
-            return await applyProxy();
+        case "companion:setBasePort":
+            if (!isPort(message.port)) return await getState();
+            await setConfig({ basePort: message.port, lastPort: null });
+            searchAgain();
+            return await getState();
 
-        case "companion:setPort":
-            await setConfig({ companionPort: message.port });
-            // Reconnect with new port. Closing triggers onclose -> applyProxy
-            // (direct), then onopen -> applyProxy (active) if it reconnects.
-            if (ws) ws.close();
-            wsReconnectDelay = 1000;
-            connectWebSocket();
-            return await getProxyState();
-
-        case "companion:send": {
-            // Forward a command to companion server
-            console.log("[Background] Forwarding to companion:", message.payload);
-            const sent = sendToCompanion(message.payload);
-            console.log("[Background] Send result:", sent);
-            return { sent };
-        }
-
-        case "companion:reconnect":
-            if (ws) ws.close();
-            wsReconnectDelay = 1000;
-            connectWebSocket();
-            return await getProxyState();
+        case "companion:retry":
+            searchAgain();
+            return await getState();
     }
     return undefined;
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-    handleMessage(message, sender)
+    if (!message || message.type === "state") return false;
+    handleMessage(message)
         .then((response) => sendResponse(response ?? { ok: false }))
         .catch((err) => {
-            console.error("[Background] Message handler error:", err);
+            console.error("[Bifurc] Message handler error:", err);
             sendResponse({ ok: false, error: String(err) });
         });
     return true; // keep the channel open for the async response
 });
 
-// ── Network panel context menu click handler ──────────────────────────────────
-
-chrome.contextMenus.onClicked.addListener((info) => {
-    // Chrome provides info.linkUrl = the URL of the right-clicked network request.
-    // That is the only data available without capturing requests.
-    const requestUrl = info.linkUrl;
-    if (!requestUrl) return;
-
-    if (info.menuItemId === "bifurc-mock") {
-        handleMockRequest(requestUrl);
-    } else if (info.menuItemId === "bifurc-request") {
-        handleAddRequest(requestUrl);
-    }
-});
-
-// ── DevTools request handlers ─────────────────────────────────────────────────
-
-function generateId() {
-    return Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
-}
-
-function handleMockRequest(url) {
-    const urlObj = (() => { try { return new URL(url); } catch { return null; } })();
-
-    const payload = {
-        id: generateId(),
-        action: "mock:add",
-        payload: {
-            name: urlObj ? `GET ${urlObj.pathname}` : `GET ${url}`,
-            method: "GET",
-            urlPattern: url,
-            useRegex: false,
-            enabled: true,
-            capturedHeaders: {},
-            capturedBody: "",
-            responseStatus: 200,
-            responseHeaders: {},
-            responseBody: "",
-            folderId: null,
-        },
-    };
-
-    sendToCompanion(payload);
-}
-
-function handleAddRequest(url) {
-    const urlObj = (() => { try { return new URL(url); } catch { return null; } })();
-
-    const payload = {
-        id: generateId(),
-        action: "request:add",
-        payload: {
-            name: urlObj ? `GET ${urlObj.pathname}` : `GET ${url}`,
-            method: "GET",
-            url,
-            headers: {},
-            body: "",
-            folderId: null,
-        },
-    };
-
-    sendToCompanion(payload);
-}
-
 // ── Proxy failure handling ────────────────────────────────────────────────────
 //
-// The companion server can be connected over WebSocket while the proxy server
-// inside the app is switched off. In that case every proxied request dies with
-// a proxy-level network error and Chrome shows a bare error page. We catch that
-// here and send the tab to a help page instead, explaining the likely cause.
+// The forward proxy can die between two status polls. Until the next poll
+// notices and falls back to direct, a proxied navigation fails with a bare
+// Chrome error page. We catch that here and send the tab to a help page.
 //
 // Only main_frame navigations can be replaced with HTML — a failed sub-resource
 // (XHR, image, script) has nowhere to render a document.
@@ -395,7 +481,6 @@ const recentRedirects = new Map(); // tabId -> timestamp
 const NON_HTTP_SCHEME_RE = /^(chrome|chrome-extension|edge|about|devtools|view-source|data|blob):/i;
 
 function handleRequestError(details) {
-    // A failed sub-resource cannot display a document.
     if (details.type !== "main_frame") return;
     // A failure with the proxy switched off is just a normal network error —
     // we must not claim the proxy caused it.
@@ -412,9 +497,8 @@ function handleRequestError(details) {
     if (now - (recentRedirects.get(details.tabId) || 0) < REDIRECT_COOLDOWN_MS) return;
     recentRedirects.set(details.tabId, now);
 
-    console.log(
-        `[Bifurc] Proxied request failed (${details.error}) — showing proxy help page`
-    );
+    // The proxy may be gone for good: find out now rather than at the next poll.
+    refreshForward();
 
     const target = chrome.runtime.getURL(
         "proxy-error.html?url=" + encodeURIComponent(details.url || "")
@@ -430,19 +514,16 @@ chrome.webRequest.onErrorOccurred.addListener(handleRequestError, {
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
 
-// Apply proxy settings on startup. Because the WebSocket is not open yet this
-// resolves to "direct" — the proxy is enabled automatically once we connect.
+// Nothing is connected yet, so this resolves to "direct"; the proxy is applied
+// once the session is up and the engine has reported its forward proxy.
 applyProxy();
 
-// Connect to companion server
-connectWebSocket();
+// Every wake of the service worker looks for the desktop app.
+discover();
 
-// Handle alarm for keep-alive (service workers can be killed)
+// Service workers can be killed while idle: the alarm brings one back to look
+// for the desktop app again.
 chrome.alarms?.create("keepalive", { periodInMinutes: 0.5 });
 chrome.alarms?.onAlarm.addListener((alarm) => {
-    if (alarm.name === "keepalive") {
-        if (!isConnected()) {
-            connectWebSocket();
-        }
-    }
+    if (alarm.name === "keepalive" && !isConnected() && !searching) discover();
 });

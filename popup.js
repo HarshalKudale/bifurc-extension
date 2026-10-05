@@ -1,30 +1,45 @@
 /**
  * Bifurc Companion — Popup Script
  *
- * The popup is a thin view over the background worker's resolved state.
- * `proxyActive` (toggle ON **and** companion connected) is the only value that
- * means traffic is really being routed; everything else is direct passthrough.
+ * A thin view over the background worker's resolved state. `proxyActive`
+ * (toggle on, desktop app connected, its forward proxy running) is the only
+ * value that means traffic is really being routed; everything else is direct.
+ *
+ * The companion port is only offered while the desktop app has not been found:
+ * once connected there is nothing to configure, and the forward proxy's port
+ * always comes from the engine.
  */
 
 const els = {
-    statusCard: document.getElementById("statusCard"),
-    statusText: document.getElementById("statusText"),
-    reconnectBtn: document.getElementById("reconnectBtn"),
+    connDot: document.getElementById("connDot"),
+    connText: document.getElementById("connText"),
     proxyToggle: document.getElementById("proxyToggle"),
-    proxyPort: document.getElementById("proxyPort"),
-    companionPort: document.getElementById("companionPort"),
-    proxyState: document.getElementById("proxyState"),
-    proxyStateText: document.getElementById("proxyStateText"),
+    proxyText: document.getElementById("proxyText"),
+    find: document.getElementById("find"),
+    findText: document.getElementById("findText"),
+    findForm: document.getElementById("findForm"),
+    basePort: document.getElementById("basePort"),
+    portDown: document.getElementById("portDown"),
+    portUp: document.getElementById("portUp"),
+    retryBtn: document.getElementById("retryBtn"),
 };
 
 // Mirrors background state so render() can stay synchronous.
-const state = {
+let state = {
     connected: false,
+    searching: true,
+    notFound: false,
+    basePort: 9271,
+    scanAhead: 10,
     proxyEnabled: false,
     proxyActive: false,
-    proxyPort: 80,
-    companionPort: 9271,
+    forwardRunning: false,
+    forwardPort: null,
 };
+
+// The base port last written into the field, so a re-render does not undo an
+// edit the user has not submitted yet.
+let shownBasePort = null;
 
 // ── Messaging ─────────────────────────────────────────────────────────────────
 
@@ -40,12 +55,8 @@ function send(message, callback) {
 }
 
 function applyState(next) {
-    if (!next) return;
-    if (typeof next.connected === "boolean") state.connected = next.connected;
-    if (typeof next.proxyEnabled === "boolean") state.proxyEnabled = next.proxyEnabled;
-    if (typeof next.proxyActive === "boolean") state.proxyActive = next.proxyActive;
-    if (Number.isFinite(next.proxyPort)) state.proxyPort = next.proxyPort;
-    if (Number.isFinite(next.companionPort)) state.companionPort = next.companionPort;
+    if (!next || typeof next.connected !== "boolean") return;
+    state = { ...state, ...next };
     render();
 }
 
@@ -55,79 +66,78 @@ function refresh() {
 
 // ── Render ────────────────────────────────────────────────────────────────────
 
+function proxyDescription() {
+    if (state.proxyActive) return `Browser traffic goes through 127.0.0.1:${state.forwardPort}.`;
+    if (!state.proxyEnabled) return "Browser traffic goes direct.";
+    if (!state.connected) return "Waiting for Bifurc. Traffic goes direct until it connects.";
+    return "The forward proxy is stopped in Bifurc. Traffic goes direct until it starts.";
+}
+
 function render() {
-    // Connection pill
-    els.statusCard.classList.toggle("on", state.connected);
-    els.statusText.textContent = state.connected
-        ? "Connected to Bifurc"
-        : "Companion server offline";
+    els.connDot.className = "dot" + (state.connected ? " success" : "");
+    els.connText.textContent = state.connected
+        ? "Connected"
+        : state.notFound ? "Not connected" : "Searching…";
 
-    // Toggle reflects stored intent
+    // The toggle reflects the stored choice; the text says what it results in.
     els.proxyToggle.checked = state.proxyEnabled;
+    els.proxyText.textContent = proxyDescription();
 
-    // Resolved routing state — this is what actually matters
-    els.proxyState.classList.remove("active", "paused");
-    if (state.proxyActive) {
-        els.proxyState.classList.add("active");
-        els.proxyStateText.innerHTML =
-            `Routing via <code>127.0.0.1:${state.proxyPort}</code>`;
-    } else if (state.proxyEnabled) {
-        els.proxyState.classList.add("paused");
-        els.proxyStateText.textContent = "Paused — companion server not connected";
-    } else {
-        els.proxyStateText.textContent = "Direct passthrough — proxy is off";
+    // The port is only a way out when the search has failed.
+    els.find.hidden = state.connected || !state.notFound;
+    const last = Math.min(state.basePort + state.scanAhead, 65535);
+    els.findText.textContent =
+        `Nothing answered on ports ${state.basePort}–${last}. Open Bifurc, or enter the ` +
+        "companion port from its Settings → Ports.";
+    if (state.basePort !== shownBasePort) {
+        els.basePort.value = state.basePort;
+        shownBasePort = state.basePort;
     }
-
-    // Ports — never clobber the field the user is currently editing
-    if (document.activeElement !== els.proxyPort) els.proxyPort.value = state.proxyPort;
-    if (document.activeElement !== els.companionPort) els.companionPort.value = state.companionPort;
+    els.retryBtn.disabled = state.searching;
+    els.retryBtn.textContent = state.searching ? "Searching…" : "Search again";
 }
 
 // ── Event handlers ────────────────────────────────────────────────────────────
 
 els.proxyToggle.addEventListener("change", () => {
     state.proxyEnabled = els.proxyToggle.checked;
+    state.proxyActive = state.proxyEnabled && state.forwardRunning;
     render(); // optimistic — avoids a visible lag on the switch
     send({ type: "proxy:toggle", enabled: state.proxyEnabled }, applyState);
 });
 
-function commitPort(input, key, messageType) {
-    const value = parseInt(input.value, 10);
-    if (!Number.isFinite(value) || value < 1 || value > 65535 || value === state[key]) {
-        render(); // revert to the last known-good value
-        return;
-    }
-    send({ type: messageType, port: value }, applyState);
+function stepPort(delta) {
+    const current = parseInt(els.basePort.value, 10);
+    const port = Number.isInteger(current) ? current + delta : state.basePort;
+    els.basePort.value = Math.min(Math.max(port, 1), 65535);
 }
 
-els.proxyPort.addEventListener("change", () =>
-    commitPort(els.proxyPort, "proxyPort", "proxy:setPort"));
-els.companionPort.addEventListener("change", () =>
-    commitPort(els.companionPort, "companionPort", "companion:setPort"));
+els.portDown.addEventListener("click", () => stepPort(-1));
+els.portUp.addEventListener("click", () => stepPort(1));
 
-for (const input of [els.proxyPort, els.companionPort]) {
-    input.addEventListener("keydown", (e) => {
-        if (e.key === "Enter") input.blur();
-        if (e.key === "Escape") render();
-    });
-}
-
-els.reconnectBtn.addEventListener("click", () => {
-    els.reconnectBtn.classList.add("spin");
-    send({ type: "companion:reconnect" }, (res) => {
-        applyState(res);
-        setTimeout(() => els.reconnectBtn.classList.remove("spin"), 600);
-    });
+els.findForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const port = parseInt(els.basePort.value, 10);
+    if (!Number.isInteger(port) || port < 1 || port > 65535) return;
+    state.searching = true;
+    render();
+    els.basePort.blur();
+    send(
+        port === state.basePort
+            ? { type: "companion:retry" }
+            : { type: "companion:setBasePort", port },
+        applyState,
+    );
 });
 
 // ── Live updates ──────────────────────────────────────────────────────────────
 
 chrome.runtime.onMessage.addListener((message) => {
-    if (message && message.type === "companion:status") applyState(message);
+    if (message && message.type === "state") applyState(message);
 });
 
 // Light poll so the popup stays correct if the service worker restarted while
-// the popup was open and missed a status broadcast.
+// the popup was open and missed a broadcast.
 const pollTimer = setInterval(refresh, 3000);
 window.addEventListener("unload", () => clearInterval(pollTimer));
 

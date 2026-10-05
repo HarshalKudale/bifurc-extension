@@ -1,12 +1,12 @@
 {
     "manifest_version": 3,
     "name": "Bifurc Companion",
-    "version": "1.0.0",
-    "description": "Proxy toggle and DevTools integration for Bifurc",
+    "version": "2.0.0",
+    "description": "Send browser traffic through the Bifurc desktop app's proxy",
     "permissions": [
         "proxy",
         "storage",
-        "contextMenus",
+        "alarms",
         "webRequest"
     ],
     "host_permissions": [
@@ -23,7 +23,6 @@
             "128": "icons/icon128.png"
         }
     },
-    "devtools_page": "devtools.html",
     "icons": {
         "16": "icons/icon16.png",
         "48": "icons/icon48.png",

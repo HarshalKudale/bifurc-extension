@@ -35,6 +35,7 @@ let state = {
     proxyActive: false,
     forwardRunning: false,
     forwardPort: null,
+    needsPrivateAccess: false,
 };
 
 // The base port last written into the field, so a re-render does not undo an
@@ -69,6 +70,10 @@ function refresh() {
 function proxyDescription() {
     if (state.proxyActive) return `Browser traffic goes through 127.0.0.1:${state.forwardPort}.`;
     if (!state.proxyEnabled) return "Browser traffic goes direct.";
+    if (state.needsPrivateAccess) {
+        return "Firefox needs this extension allowed in private windows before it can set " +
+            "the proxy. Allow it in Add-ons and themes. Traffic goes direct until then.";
+    }
     if (!state.connected) return "Waiting for Bifurc. Traffic goes direct until it connects.";
     return "The forward proxy is stopped in Bifurc. Traffic goes direct until it starts.";
 }
@@ -101,7 +106,7 @@ function render() {
 
 els.proxyToggle.addEventListener("change", () => {
     state.proxyEnabled = els.proxyToggle.checked;
-    state.proxyActive = state.proxyEnabled && state.forwardRunning;
+    state.proxyActive = state.proxyEnabled && state.forwardRunning && !state.needsPrivateAccess;
     render(); // optimistic — avoids a visible lag on the switch
     send({ type: "proxy:toggle", enabled: state.proxyEnabled }, applyState);
 });

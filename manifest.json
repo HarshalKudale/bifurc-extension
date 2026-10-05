@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Bifurc Companion",
-    "version": "2.0.0",
+    "version": "1.0.1",
     "description": "Send browser traffic through the Bifurc desktop app's proxy",
     "permissions": [
         "proxy",
@@ -13,7 +13,10 @@
         "<all_urls>"
     ],
     "background": {
-        "service_worker": "background.js"
+        "service_worker": "background.js",
+        "scripts": [
+            "background.js"
+        ]
     },
     "action": {
         "default_popup": "popup.html",
@@ -28,5 +31,19 @@
         "48": "icons/icon48.png",
         "128": "icons/icon128.png"
     },
-    "minimum_chrome_version": "126"
+    "content_security_policy": {
+        "extension_pages": "script-src 'self'; object-src 'self'"
+    },
+    "minimum_chrome_version": "126",
+    "browser_specific_settings": {
+        "gecko": {
+            "id": "bifurc-companion@bifurc",
+            "strict_min_version": "140.0",
+            "data_collection_permissions": {
+                "required": [
+                    "none"
+                ]
+            }
+        }
+    }
 }

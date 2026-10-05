@@ -1,10 +1,11 @@
-# ===== Bifurc Companion — Chrome MV3 extension =====
+# ===== Bifurc Companion — Chrome / Firefox MV3 extension =====
 # This repository holds the browser extension only. The Electron desktop app
 # (`bifurc`) and the website (`bifurc-studio`) are separate repositories with
 # their own .gitignore files.
 #
 # The extension is plain JS with no build step: the files at the repo root are
-# exactly what gets loaded unpacked in Chrome/Edge and zipped for the Web Store.
+# exactly what gets loaded unpacked in Chrome/Edge/Firefox. `npm run
+# package:chrome` / `package:firefox` zip them into `dist/` for the stores.
 
 # ===== Dependencies =====
 # Only relevant if a bundler or test runner is added later.

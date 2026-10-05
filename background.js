@@ -1,5 +1,6 @@
 /**
  * Bifurc Companion — Background Service Worker
+ * (Chrome runs it as a service worker, Firefox as an event page.)
  *
  * The extension is a proxy switch for the Bifurc desktop app:
  * 1. It finds the app's companion server (a WebSocket on loopback) and opens
@@ -40,6 +41,9 @@ const MAX_RETRY_DELAY_MS = 15000;
 
 const EVENTS = ["event.settings.changed", "event.server.error", "event.engine.stopping"];
 
+/** Firefox shapes proxy settings and network errors differently from Chrome. */
+const IS_FIREFOX = chrome.runtime.getURL("").startsWith("moz-extension:");
+
 const DEFAULTS = {
     proxyEnabled: false,
     basePort: DEFAULT_BASE_PORT,
@@ -66,7 +70,7 @@ const pending = new Map();  // rpc id -> { resolve, reject, timer }
 
 // Monotonic guard so a slow/racing applyProxy() can never clobber a newer one.
 let proxyApplySeq = 0;
-// Identity of the proxy config currently pushed to Chrome ("direct" | "pac:<port>").
+// Identity of the proxy config currently pushed to the browser ("direct" | "proxy:<port>").
 // null until the first successful apply in this service-worker lifetime.
 let appliedProxyKey = null;
 // Synchronous mirror of "Chrome is routing regular traffic through our proxy".
@@ -97,14 +101,29 @@ function isConnected() {
 }
 
 /**
+ * Firefox only lets an extension change proxy settings once the user has
+ * allowed it in private windows (about:addons). Chrome has no such rule.
+ */
+async function needsPrivateAccess() {
+    if (!IS_FIREFOX) return false;
+    try {
+        return !(await chrome.extension.isAllowedIncognitoAccess());
+    } catch {
+        return false;
+    }
+}
+
+/**
  * Resolved, UI-facing state. `proxyActive` is the single source of truth for
  * whether traffic is actually being routed through the proxy right now.
  */
 async function getState() {
     const { proxyEnabled, basePort } = await getConfig();
+    const blocked = await needsPrivateAccess();
     const connected = isConnected();
     const forwardRunning = connected && forward.running && isPort(forward.port);
     return {
+        needsPrivateAccess: blocked,
         connected,
         searching,
         notFound: !connected && notFound,
@@ -113,7 +132,7 @@ async function getState() {
         companionPort: connected ? companionPort : null,
         engineVersion: connected ? engineVersion : null,
         proxyEnabled: !!proxyEnabled,
-        proxyActive: !!proxyEnabled && forwardRunning,
+        proxyActive: !!proxyEnabled && forwardRunning && !blocked,
         forwardRunning,
         forwardPort: forwardRunning ? forward.port : null,
         forwardError: connected ? forward.error : null,
@@ -136,10 +155,23 @@ function buildPacScript(port) {
     return `function FindProxyForURL(url, host) { return "PROXY ${HOST}:${port}"; }`;
 }
 
+/** The `proxy.settings` value that routes HTTP and HTTPS to `port`. */
+function buildProxyValue(port) {
+    if (IS_FIREFOX) {
+        // Firefox takes no inline PAC script; a manual proxy does the same job.
+        const address = `${HOST}:${port}`;
+        return { proxyType: "manual", http: address, ssl: address };
+    }
+    return { mode: "pac_script", pacScript: { data: buildPacScript(port) } };
+}
+
+/** Firefox has a single scope and does not take the argument. */
+const PROXY_SCOPE = IS_FIREFOX ? {} : { scope: "regular" };
+
 /**
- * Reconcile Chrome's proxy settings with the current desired state.
+ * Reconcile the browser's proxy settings with the current desired state.
  *
- *   toggle on && forward proxy reachable  ->  PAC script pointing at its port
+ *   toggle on && forward proxy reachable  ->  proxy pointing at its port
  *   otherwise                             ->  clear proxy settings (direct)
  */
 async function applyProxy() {
@@ -152,24 +184,25 @@ async function applyProxy() {
     // Reset to null whenever the service worker restarts, which is what we
     // want: Chrome may still hold settings from a previous lifetime, so the
     // first apply must always run.
-    const desiredKey = state.proxyActive ? `pac:${state.forwardPort}` : "direct";
+    const desiredKey = state.proxyActive ? `proxy:${state.forwardPort}` : "direct";
 
     // Keep the synchronous mirror in step before any early return, so the
     // webRequest listener sees the truth even on the skip path.
     proxyRouted = state.proxyActive;
 
-    if (desiredKey !== appliedProxyKey) {
+    if (state.needsPrivateAccess) {
+        // Firefox would reject the call, and without that access nothing of
+        // ours can be in place. Apply afresh once the user grants it.
+        appliedProxyKey = null;
+    } else if (desiredKey !== appliedProxyKey) {
         try {
             if (state.proxyActive) {
                 await chrome.proxy.settings.set({
-                    value: {
-                        mode: "pac_script",
-                        pacScript: { data: buildPacScript(state.forwardPort) },
-                    },
-                    scope: "regular",
+                    value: buildProxyValue(state.forwardPort),
+                    ...PROXY_SCOPE,
                 });
             } else {
-                await chrome.proxy.settings.clear({ scope: "regular" });
+                await chrome.proxy.settings.clear(PROXY_SCOPE);
             }
             appliedProxyKey = desiredKey;
             console.log(`[Bifurc] Proxy ${state.proxyActive ? `ON -> ${HOST}:${state.forwardPort}` : "OFF (direct)"}`);
@@ -470,15 +503,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 // (XHR, image, script) has nowhere to render a document.
 
 // Chrome documents the `error` string as not stable across releases, so match on
-// the distinctive fragments rather than the full "net::" prefix.
+// the distinctive fragments rather than the full "net::" prefix. Firefox reports
+// its own `NS_ERROR_PROXY_*` names.
 const PROXY_FAILURE_RE =
-    /PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|MANDATORY_PROXY_CONFIGURATION_FAILED/i;
+    /PROXY_CONNECTION_FAILED|TUNNEL_CONNECTION_FAILED|MANDATORY_PROXY_CONFIGURATION_FAILED|NS_ERROR_PROXY_|NS_ERROR_UNKNOWN_PROXY_HOST/i;
 
 // Per-tab cooldown so a burst of failures cannot spam redirects.
 const REDIRECT_COOLDOWN_MS = 1500;
 const recentRedirects = new Map(); // tabId -> timestamp
 
-const NON_HTTP_SCHEME_RE = /^(chrome|chrome-extension|edge|about|devtools|view-source|data|blob):/i;
+const NON_HTTP_SCHEME_RE = /^(chrome|chrome-extension|moz-extension|edge|about|devtools|view-source|data|blob):/i;
 
 function handleRequestError(details) {
     if (details.type !== "main_frame") return;

@@ -1,0 +1,12 @@
+{
+    "name": "bifurc-companion",
+    "private": true,
+    "description": "Send browser traffic through the Bifurc desktop app's proxy",
+    "scripts": {
+        "package:chrome": "node scripts/package.mjs chrome",
+        "package:firefox": "node scripts/package.mjs firefox"
+    },
+    "engines": {
+        "node": ">=22.2"
+    }
+}

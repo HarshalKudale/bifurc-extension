@@ -56,7 +56,7 @@ const DEFAULTS = {
 let ws = null;              // the socket of the established session
 let companionPort = null;   // the port that session is on
 let engineVersion = null;
-let forward = { running: false, port: 0, error: null };
+let forward = { running: false, port: 0, https: false, error: null };
 
 let searching = false;      // a search is in flight
 let notFound = false;       // the last search finished without finding the app
@@ -135,6 +135,7 @@ async function getState() {
         proxyActive: !!proxyEnabled && forwardRunning && !blocked,
         forwardRunning,
         forwardPort: forwardRunning ? forward.port : null,
+        forwardHttps: forwardRunning && forward.https,
         forwardError: connected ? forward.error : null,
     };
 }
@@ -151,18 +152,20 @@ function broadcastState(state) {
 
 // ── Proxy management ──────────────────────────────────────────────────────────
 
-function buildPacScript(port) {
-    return `function FindProxyForURL(url, host) { return "PROXY ${HOST}:${port}"; }`;
+function buildPacScript(port, https) {
+    // With HTTPS on, the engine's proxy port speaks TLS to the browser (and still takes plain clients).
+    const scheme = https ? "HTTPS" : "PROXY";
+    return `function FindProxyForURL(url, host) { return "${scheme} ${HOST}:${port}"; }`;
 }
 
-/** The `proxy.settings` value that routes HTTP and HTTPS to `port`. */
-function buildProxyValue(port) {
+/** The `proxy.settings` value that routes HTTP and HTTPS to `port`, over an HTTPS proxy connection if `https`. */
+function buildProxyValue(port, https) {
     if (IS_FIREFOX) {
         // Firefox takes no inline PAC script; a manual proxy does the same job.
-        const address = `${HOST}:${port}`;
+        const address = `${https ? "https://" : ""}${HOST}:${port}`;
         return { proxyType: "manual", http: address, ssl: address };
     }
-    return { mode: "pac_script", pacScript: { data: buildPacScript(port) } };
+    return { mode: "pac_script", pacScript: { data: buildPacScript(port, https) } };
 }
 
 /** Firefox has a single scope and does not take the argument. */
@@ -184,7 +187,7 @@ async function applyProxy() {
     // Reset to null whenever the service worker restarts, which is what we
     // want: Chrome may still hold settings from a previous lifetime, so the
     // first apply must always run.
-    const desiredKey = state.proxyActive ? `proxy:${state.forwardPort}` : "direct";
+    const desiredKey = state.proxyActive ? `proxy:${state.forwardHttps ? "https" : "http"}:${state.forwardPort}` : "direct";
 
     // Keep the synchronous mirror in step before any early return, so the
     // webRequest listener sees the truth even on the skip path.
@@ -198,7 +201,7 @@ async function applyProxy() {
         try {
             if (state.proxyActive) {
                 await chrome.proxy.settings.set({
-                    value: buildProxyValue(state.forwardPort),
+                    value: buildProxyValue(state.forwardPort, state.forwardHttps),
                     ...PROXY_SCOPE,
                 });
             } else {
@@ -377,7 +380,7 @@ function sessionEnded() {
     ws = null;
     companionPort = null;
     engineVersion = null;
-    forward = { running: false, port: 0, error: null };
+    forward = { running: false, port: 0, https: false, error: null };
     if (pollTimer) clearInterval(pollTimer);
     pollTimer = null;
     for (const [id, call] of pending) {
@@ -482,6 +485,7 @@ async function refreshForward() {
         forward = {
             running: !!status.running,
             port: Number(status.port) || 0,
+            https: !!status.https,
             error: typeof status.error === "string" ? status.error : null,
         };
     } catch (err) {

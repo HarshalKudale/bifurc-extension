@@ -251,6 +251,40 @@ async function looksLikeEngine(port) {
 }
 
 /**
+ * What the engine is told about this browser, for the app's Settings to list: which browser and version,
+ * on which operating system, and which installed extension this is. Every member is optional.
+ */
+async function describeClient() {
+    const info = {
+        extensionId: chrome.runtime.id,
+        userAgent: navigator.userAgent,
+        language: navigator.language,
+    };
+
+    // Chromium names its brands (Chrome, Edge, Brave, …); the user agent only says "Chrome".
+    const brands = (navigator.userAgentData && navigator.userAgentData.brands) || [];
+    const brand = brands.find((b) => !/not.?a.?brand|chromium/i.test(b.brand)) || brands.find((b) => /chromium/i.test(b.brand));
+    if (brand) {
+        info.browser = brand.brand;
+        info.browserVersion = brand.version;
+    } else {
+        const match = navigator.userAgent.match(/(Firefox|Edg|OPR|Chrome|Safari)\/([\d.]+)/);
+        if (match) {
+            info.browser = { Edg: "Edge", OPR: "Opera" }[match[1]] || match[1];
+            info.browserVersion = match[2];
+        }
+    }
+    if (IS_FIREFOX) info.browser = "Firefox";
+
+    try {
+        const platform = await chrome.runtime.getPlatformInfo();
+        info.os = { win: "Windows", mac: "macOS", linux: "Linux", android: "Android", cros: "ChromeOS" }[platform.os] || platform.os;
+        info.arch = platform.arch;
+    } catch { /* the platform stays unnamed */ }
+    return info;
+}
+
+/**
  * Open a session on `port`: connect, then `hello`. Resolves true once the
  * engine has accepted the handshake and this socket is the live session.
  */
@@ -275,7 +309,9 @@ function openSession(port, token) {
         };
         const timer = setTimeout(fail, HELLO_TIMEOUT_MS);
 
-        socket.onopen = () => {
+        socket.onopen = async () => {
+            const clientInfo = await describeClient();
+            if (socket.readyState !== WebSocket.OPEN) return;
             socket.send(JSON.stringify({
                 id: helloId,
                 action: "hello",
@@ -283,6 +319,7 @@ function openSession(port, token) {
                     protocolVersion: PROTOCOL_VERSION,
                     clientName: CLIENT_NAME,
                     clientVersion: chrome.runtime.getManifest().version,
+                    clientInfo,
                 },
             }));
         };

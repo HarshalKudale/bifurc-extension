@@ -15,6 +15,7 @@ const els = {
     connText: document.getElementById("connText"),
     proxyToggle: document.getElementById("proxyToggle"),
     proxyText: document.getElementById("proxyText"),
+    access: document.getElementById("access"),
     find: document.getElementById("find"),
     findText: document.getElementById("findText"),
     findForm: document.getElementById("findForm"),
@@ -68,12 +69,9 @@ function refresh() {
 // ── Render ────────────────────────────────────────────────────────────────────
 
 function proxyDescription() {
+    if (state.needsPrivateAccess) return "Unavailable. Browser traffic goes direct.";
     if (state.proxyActive) return `Browser traffic goes through 127.0.0.1:${state.forwardPort}.`;
     if (!state.proxyEnabled) return "Browser traffic goes direct.";
-    if (state.needsPrivateAccess) {
-        return "Firefox needs this extension allowed in private windows before it can set " +
-            "the proxy. Allow it in Add-ons and themes. Traffic goes direct until then.";
-    }
     if (!state.connected) return "Waiting for Bifurc. Traffic goes direct until it connects.";
     return "The forward proxy is stopped in Bifurc. Traffic goes direct until it starts.";
 }
@@ -85,8 +83,11 @@ function render() {
         : state.notFound ? "Not connected" : "Searching…";
 
     // The toggle reflects the stored choice; the text says what it results in.
-    els.proxyToggle.checked = state.proxyEnabled;
+    // It cannot be switched on until Firefox lets the extension set the proxy.
+    els.proxyToggle.checked = state.proxyEnabled && !state.needsPrivateAccess;
+    els.proxyToggle.disabled = state.needsPrivateAccess;
     els.proxyText.textContent = proxyDescription();
+    els.access.hidden = !state.needsPrivateAccess;
 
     // The port is only a way out when the search has failed.
     els.find.hidden = state.connected || !state.notFound;
@@ -105,6 +106,10 @@ function render() {
 // ── Event handlers ────────────────────────────────────────────────────────────
 
 els.proxyToggle.addEventListener("change", () => {
+    if (state.needsPrivateAccess) {
+        render();
+        return;
+    }
     state.proxyEnabled = els.proxyToggle.checked;
     state.proxyActive = state.proxyEnabled && state.forwardRunning && !state.needsPrivateAccess;
     render(); // optimistic — avoids a visible lag on the switch

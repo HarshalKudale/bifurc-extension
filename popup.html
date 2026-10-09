@@ -104,6 +104,44 @@
             outline-offset: 2px;
         }
 
+        .switch input:disabled {
+            cursor: not-allowed;
+        }
+
+        .switch input:disabled+.track {
+            opacity: .5;
+        }
+
+        /* ── Private-window access (Firefox) ──────────────────────────────── */
+        .access {
+            padding: var(--space-lg);
+            border-top: 1px solid var(--border);
+        }
+
+        .access[hidden] {
+            display: none;
+        }
+
+        .access .label {
+            display: flex;
+            align-items: center;
+            gap: var(--space-sm);
+            font-weight: 500;
+        }
+
+        .access .muted {
+            margin-top: var(--space-xs);
+        }
+
+        .access ol {
+            padding-left: var(--space-lg);
+        }
+
+        .access strong {
+            color: var(--foreground);
+            font-weight: 500;
+        }
+
         /* ── Not found ────────────────────────────────────────────────────── */
         .find {
             padding: var(--space-lg);
@@ -188,6 +226,17 @@
             <span class="track"></span>
         </span>
     </div>
+
+    <section class="access" id="access" role="alert" hidden>
+        <p class="label"><span class="dot warning"></span>Allow Bifurc in private windows</p>
+        <p class="muted">Firefox only lets an extension set the proxy once it is allowed in private
+            windows. The proxy stays off until you allow it:</p>
+        <ol class="muted">
+            <li>Open <strong>Add-ons and themes</strong> (Ctrl+Shift+A).</li>
+            <li>Under <strong>Extensions</strong>, select <strong>Bifurc Companion</strong>.</li>
+            <li>Set <strong>Run in Private Windows</strong> to <strong>Allow</strong>.</li>
+        </ol>
+    </section>
 
     <section class="find" id="find" hidden>
         <p class="label">Bifurc isn't running on the expected ports</p>

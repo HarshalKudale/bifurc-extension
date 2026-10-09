@@ -118,8 +118,12 @@ async function needsPrivateAccess() {
  * whether traffic is actually being routed through the proxy right now.
  */
 async function getState() {
-    const { proxyEnabled, basePort } = await getConfig();
+    const config = await getConfig();
+    const { basePort } = config;
     const blocked = await needsPrivateAccess();
+    // The toggle cannot be on while Firefox withholds the proxy from us: the
+    // user has to grant the access first, then switch it on.
+    const proxyEnabled = config.proxyEnabled && !blocked;
     const connected = isConnected();
     const forwardRunning = connected && forward.running && isPort(forward.port);
     return {
@@ -172,6 +176,16 @@ function buildProxyValue(port, https) {
 const PROXY_SCOPE = IS_FIREFOX ? {} : { scope: "regular" };
 
 /**
+ * Flag the toolbar button while the extension cannot do its job, so the user
+ * is sent to the popup, which says what to allow.
+ */
+function showAccessBadge(blocked) {
+    if (!IS_FIREFOX) return;
+    chrome.action.setBadgeBackgroundColor({ color: "#ca8a04" }).catch(() => { });
+    chrome.action.setBadgeText({ text: blocked ? "!" : "" }).catch(() => { });
+}
+
+/**
  * Reconcile the browser's proxy settings with the current desired state.
  *
  *   toggle on && forward proxy reachable  ->  proxy pointing at its port
@@ -192,6 +206,8 @@ async function applyProxy() {
     // Keep the synchronous mirror in step before any early return, so the
     // webRequest listener sees the truth even on the skip path.
     proxyRouted = state.proxyActive;
+
+    showAccessBadge(state.needsPrivateAccess);
 
     if (state.needsPrivateAccess) {
         // Firefox would reject the call, and without that access nothing of
@@ -507,7 +523,9 @@ async function handleMessage(message) {
             return await getState();
 
         case "proxy:toggle":
-            await setConfig({ proxyEnabled: !!message.enabled });
+            // Never store "on" while Firefox would ignore it: that reads as a
+            // working proxy while traffic goes direct.
+            await setConfig({ proxyEnabled: !!message.enabled && !(await needsPrivateAccess()) });
             return await applyProxy();
 
         case "companion:setBasePort":
@@ -588,6 +606,12 @@ chrome.webRequest.onErrorOccurred.addListener(handleRequestError, {
 });
 
 // ── Lifecycle ─────────────────────────────────────────────────────────────────
+
+// A toggle switched on before the private-window access was required to do so
+// is dropped, so granting the access later does not start routing unasked.
+needsPrivateAccess().then((blocked) => {
+    if (blocked) setConfig({ proxyEnabled: false });
+});
 
 // Nothing is connected yet, so this resolves to "direct"; the proxy is applied
 // once the session is up and the engine has reported its forward proxy.

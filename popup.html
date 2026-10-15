@@ -196,6 +196,21 @@
             text-align: center;
         }
 
+        /* ── Review ───────────────────────────────────────────────────────── */
+        .review {
+            padding: var(--space-md) var(--space-lg);
+            border-top: 1px solid var(--border);
+            text-align: center;
+        }
+
+        .review a {
+            color: var(--muted-foreground);
+        }
+
+        .review a:hover {
+            color: var(--foreground);
+        }
+
         @media (prefers-reduced-motion: reduce) {
 
             .switch .track,
@@ -253,6 +268,10 @@
             <button class="btn" type="submit" id="retryBtn">Search again</button>
         </form>
     </section>
+
+    <footer class="review">
+        <a class="muted" id="reviewLink" href="#" target="_blank" rel="noopener">Enjoying Bifurc? Leave a review</a>
+    </footer>
 
     <script src="popup.js"></script>
 </body>

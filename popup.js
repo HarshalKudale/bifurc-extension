@@ -151,6 +151,14 @@ chrome.runtime.onMessage.addListener((message) => {
 const pollTimer = setInterval(refresh, 3000);
 window.addEventListener("unload", () => clearInterval(pollTimer));
 
+// ── Review ────────────────────────────────────────────────────────────────────
+
+// Each store's own review page; Firefox is told apart by its extension URL scheme.
+const isFirefox = chrome.runtime.getURL("").startsWith("moz-extension:");
+document.getElementById("reviewLink").href = isFirefox
+    ? "https://addons.mozilla.org/en-US/firefox/addon/bifurc-companion/reviews/"
+    : "https://chromewebstore.google.com/detail/bifurc-companion/dcifgipphabedoiemccjpocgiganpjhi/reviews";
+
 // ── Init ──────────────────────────────────────────────────────────────────────
 
 render();

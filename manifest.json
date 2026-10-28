@@ -7,7 +7,8 @@
         "proxy",
         "storage",
         "alarms",
-        "webRequest"
+        "webRequest",
+        "cookies"
     ],
     "host_permissions": [
         "<all_urls>"

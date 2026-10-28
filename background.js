@@ -606,13 +606,99 @@ function stringMap(value) {
     return out;
 }
 
+// ── Cookies for page traffic ──
+//
+// A page's own request object never shows the cookies the browser would add,
+// and a Response built in the page cannot set any. So the engine is given the
+// browser's cookies with each request, and what an answer it gave sets is
+// stored here.
+
+/** The cookie store of the tab a port belongs to (a private window or a Firefox container has its own). */
+function storeOf(sender) {
+    const tab = sender && sender.tab;
+    if (!tab) return undefined;
+    if (tab.cookieStoreId) return tab.cookieStoreId;
+    return tab.incognito ? "1" : undefined;
+}
+
+/** `wss:` cookies are the `https:` ones. */
+function cookieUrl(url) {
+    return url.replace(/^ws/i, "http");
+}
+
+/** The `Cookie` header the browser would send with this request, if any. */
+async function cookieHeader(url, credentials, pageOrigin, storeId) {
+    if (credentials === "omit") return null;
+    const target = cookieUrl(url);
+    if (credentials !== "include" && new URL(target).origin !== pageOrigin) return null;
+    const cookies = await chrome.cookies.getAll({ url: target, ...(storeId ? { storeId } : {}) });
+    // Longer paths first, as a browser orders them.
+    cookies.sort((a, b) => b.path.length - a.path.length);
+    return cookies.length ? cookies.map((c) => `${c.name}=${c.value}`).join("; ") : null;
+}
+
+/** Where a cookie without a Path attribute applies: the request path up to its last slash. */
+function defaultPath(url) {
+    const path = new URL(url).pathname;
+    const slash = path.lastIndexOf("/");
+    return slash > 0 ? path.slice(0, slash) : "/";
+}
+
+/** Store one `Set-Cookie` line for `url`. */
+function setCookie(line, url, storeId) {
+    const [pair, ...attributes] = line.split(";");
+    const eq = pair.indexOf("=");
+    const target = cookieUrl(url);
+    const details = {
+        url: target,
+        name: eq < 0 ? "" : pair.slice(0, eq).trim(),
+        value: (eq < 0 ? pair : pair.slice(eq + 1)).trim(),
+        path: defaultPath(target),
+        ...(storeId ? { storeId } : {}),
+    };
+    let maxAge = null;
+    for (const attribute of attributes) {
+        const at = attribute.indexOf("=");
+        const key = (at < 0 ? attribute : attribute.slice(0, at)).trim().toLowerCase();
+        const value = at < 0 ? "" : attribute.slice(at + 1).trim();
+        if (key === "domain" && value) details.domain = value;
+        else if (key === "path" && value.startsWith("/")) details.path = value;
+        else if (key === "expires" && !Number.isNaN(Date.parse(value))) details.expirationDate = Date.parse(value) / 1000;
+        else if (key === "max-age" && /^-?\d+$/.test(value)) maxAge = Number(value);
+        else if (key === "secure") details.secure = true;
+        else if (key === "httponly") details.httpOnly = true;
+        else if (key === "samesite") {
+            const sameSite = { strict: "strict", lax: "lax", none: "no_restriction" }[value.toLowerCase()];
+            if (sameSite) details.sameSite = sameSite;
+        }
+        // shortcut: a Partitioned (CHIPS) cookie is stored unpartitioned; pass a partitionKey once a rule's
+        // target is seen relying on one.
+    }
+    if (maxAge !== null) details.expirationDate = Date.now() / 1000 + maxAge;
+    if (details.expirationDate !== undefined && details.expirationDate <= Date.now() / 1000) {
+        return chrome.cookies.remove({ url: target, name: details.name, ...(storeId ? { storeId } : {}) });
+    }
+    return chrome.cookies.set(details);
+}
+
+/** Store what an answer sets, and take `Set-Cookie` out of the headers the page gets (it never sees them). */
+async function applySetCookies(decision, url, storeId) {
+    if (!Array.isArray(decision.headers)) return;
+    const kept = [];
+    for (const [name, value] of decision.headers) {
+        if (name !== "set-cookie") kept.push([name, value]);
+        else await Promise.resolve(setCookie(value, url, storeId)).catch((err) => console.warn("[Bifurc] Cookie not stored:", err));
+    }
+    decision.headers = kept;
+}
+
 /** The streams a decision opens: the id the page reads, reports or cancels against. */
 function streamOf(decision) {
     return decision && ["relay", "socket", "continue"].includes(decision.action) ? decision.id : null;
 }
 
 /** One call from a page, as the engine command it becomes. Throws on a payload that is not one. */
-async function pageCall(action, payload, streams) {
+async function pageCall(action, payload, streams, sender) {
     payload = payload && typeof payload === "object" ? payload : {};
     if (action === "decide") {
         const url = text(payload.url);
@@ -623,7 +709,12 @@ async function pageCall(action, payload, streams) {
             headers: stringMap(payload.headers),
             body: text(payload.body),
         };
+        const storeId = storeOf(sender);
+        const pageOrigin = sender.origin || (sender.url ? new URL(sender.url).origin : "");
+        const cookie = await cookieHeader(url, text(payload.credentials), pageOrigin, storeId).catch(() => null);
+        if (cookie) request.headers.cookie = cookie;
         const decision = await rpc("browser.decide", request);
+        await applySetCookies(decision, url, storeId);
         const id = streamOf(decision);
         if (id) streams.add(id);
         return decision;
@@ -673,7 +764,7 @@ chrome.runtime.onConnect.addListener((port) => {
     post(port, { t: "state", on: pageOn });
     port.onMessage.addListener((message) => {
         if (!message || typeof message.n !== "number") return;
-        pageCall(message.action, message.payload, streams).then(
+        pageCall(message.action, message.payload, streams, port.sender || {}).then(
             (data) => post(port, { n: message.n, ok: true, data }),
             (err) => {
                 // An engine older than this extension refuses these commands: stop routing pages through it.

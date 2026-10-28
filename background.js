@@ -7,6 +7,9 @@
  *    an RPC session with it.
  * 2. It asks the engine which port its forward proxy listens on.
  * 3. The toggle routes browser traffic to that port, or leaves it direct.
+ * 4. With the toggle on and the engine not intercepting HTTPS itself, pages'
+ *    HTTPS calls are routed through the engine by inject.js (see "Page
+ *    traffic" below), so mocks, rules and capture work without its certificate.
  *
  * Finding the companion server: the app binds the first free port at or above
  * a base port (4747 unless changed in the app's Settings → Ports). So the
@@ -35,6 +38,8 @@ const CLIENT_NAME = "bifurc-extension";
 const PROBE_TIMEOUT_MS = 800;
 const HELLO_TIMEOUT_MS = 3000;
 const RPC_TIMEOUT_MS = 5000;
+/** `browser.read` waits up to 20 s for data on the engine's side. */
+const READ_TIMEOUT_MS = 30000;
 /** Also what keeps the service worker alive while a session is open. */
 const STATUS_POLL_MS = 5000;
 const MAX_RETRY_DELAY_MS = 15000;
@@ -66,6 +71,8 @@ let retryDelay = 1000;
 let pollTimer = null;
 
 let rpcSeq = 0;
+// False once the engine refused the browser.* commands (one older than this extension): pages stay native.
+let browserCommands = true;
 const pending = new Map();  // rpc id -> { resolve, reject, timer }
 
 // Monotonic guard so a slow/racing applyProxy() can never clobber a newer one.
@@ -206,6 +213,7 @@ async function applyProxy() {
     // Keep the synchronous mirror in step before any early return, so the
     // webRequest listener sees the truth even on the skip path.
     proxyRouted = state.proxyActive;
+    pushPageState(state);
 
     showAccessBadge(state.needsPrivateAccess);
 
@@ -381,6 +389,7 @@ function openSession(port, token) {
 
 async function sessionStarted(port) {
     notFound = false;
+    browserCommands = true;
     retryDelay = 1000;
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;
@@ -461,7 +470,7 @@ function searchAgain() {
 
 // ── RPC over the session ──────────────────────────────────────────────────────
 
-function rpc(action, payload) {
+function rpc(action, payload, timeoutMs = RPC_TIMEOUT_MS) {
     return new Promise((resolve, reject) => {
         if (!isConnected()) {
             reject(new Error("not connected"));
@@ -471,7 +480,7 @@ function rpc(action, payload) {
         const timer = setTimeout(() => {
             pending.delete(id);
             reject(new Error(`"${action}" timed out`));
-        }, RPC_TIMEOUT_MS);
+        }, timeoutMs);
         pending.set(id, { resolve, reject, timer });
         ws.send(JSON.stringify({ id, action, payload: payload || {} }));
     });
@@ -488,7 +497,11 @@ function handleFrame(frame) {
     pending.delete(frame.id);
     clearTimeout(call.timer);
     if (frame.ok) call.resolve(frame.data);
-    else call.reject(new Error((frame.error && frame.error.message) || "the engine refused the request"));
+    else {
+        const error = new Error((frame.error && frame.error.message) || "the engine refused the request");
+        error.code = frame.error && frame.error.code;
+        call.reject(error);
+    }
 }
 
 /** Ask the engine where its forward proxy listens, and whether it is up. */
@@ -550,6 +563,132 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             sendResponse({ ok: false, error: String(err) });
         });
     return true; // keep the channel open for the async response
+});
+
+// ── Page traffic ──────────────────────────────────────────────────────────────
+//
+// bridge.js opens a port per frame and passes on inject.js's calls. They are
+// checked here and sent to the engine as `browser.*` commands; a port can only
+// touch the streams it opened, and what it had open is cancelled when it
+// closes (the tab or frame went away).
+
+const PAGE_PORT = "bifurc-page";
+const pagePorts = new Set();
+let pageOn = false;
+
+/** Whether pages route HTTPS through the engine: proxying, and the engine not decrypting HTTPS itself. */
+function pageRouting(state) {
+    return state.proxyActive && !state.forwardHttps && browserCommands;
+}
+
+function pushPageState(state) {
+    const next = pageRouting(state);
+    if (next === pageOn) return;
+    pageOn = next;
+    for (const port of pagePorts) post(port, { t: "state", on: pageOn });
+}
+
+/** A port can close between a call and its answer. */
+function post(port, message) {
+    try {
+        port.postMessage(message);
+    } catch { /* the frame is gone */ }
+}
+
+const text = (value) => (typeof value === "string" ? value : "");
+
+/** An object of strings, whatever the page sent. */
+function stringMap(value) {
+    const out = {};
+    if (value && typeof value === "object") {
+        for (const [name, v] of Object.entries(value)) if (typeof v === "string") out[name] = v;
+    }
+    return out;
+}
+
+/** The streams a decision opens: the id the page reads, reports or cancels against. */
+function streamOf(decision) {
+    return decision && ["relay", "socket", "continue"].includes(decision.action) ? decision.id : null;
+}
+
+/** One call from a page, as the engine command it becomes. Throws on a payload that is not one. */
+async function pageCall(action, payload, streams) {
+    payload = payload && typeof payload === "object" ? payload : {};
+    if (action === "decide") {
+        const url = text(payload.url);
+        if (!/^(https|wss):/i.test(url)) throw new Error("not routed");
+        const request = {
+            method: text(payload.method) || "GET",
+            url,
+            headers: stringMap(payload.headers),
+            body: text(payload.body),
+        };
+        const decision = await rpc("browser.decide", request);
+        const id = streamOf(decision);
+        if (id) streams.add(id);
+        return decision;
+    }
+    const id = text(payload.id);
+    if (!streams.has(id)) throw new Error("no such stream");
+    switch (action) {
+        case "read": {
+            const read = await rpc("browser.read", { id }, READ_TIMEOUT_MS);
+            if (read.done) streams.delete(id);
+            return read;
+        }
+        case "open": {
+            const open = { id, status: Number.isInteger(payload.status) ? payload.status : 0, headers: stringMap(payload.headers) };
+            if (payload.kind === "sse" || payload.kind === "ws") open.kind = payload.kind;
+            return rpc("browser.open", open);
+        }
+        case "message": {
+            const m = payload.message || {};
+            const message = { direction: m.direction === "sent" ? "sent" : "received", data: text(m.data) };
+            for (const key of ["event", "eventId"]) if (typeof m[key] === "string") message[key] = m[key];
+            if (typeof m.binary === "boolean") message.binary = m.binary;
+            if (Number.isInteger(m.close)) message.close = m.close;
+            return rpc("browser.message", { id, message });
+        }
+        case "close":
+            streams.delete(id);
+            return rpc("browser.close", { id, body: text(payload.body) });
+        case "cancel":
+            streams.delete(id);
+            return rpc("browser.cancel", { id });
+        case "wsSend":
+            return rpc("browser.wsSend", { id, data: text(payload.data), binary: payload.binary === true });
+        case "wsClose": {
+            const close = { id, reason: text(payload.reason) };
+            if (Number.isInteger(payload.code) && payload.code >= 1000 && payload.code <= 4999) close.code = payload.code;
+            return rpc("browser.wsClose", close);
+        }
+    }
+    throw new Error("unknown call");
+}
+
+chrome.runtime.onConnect.addListener((port) => {
+    if (port.name !== PAGE_PORT) return;
+    const streams = new Set();
+    pagePorts.add(port);
+    post(port, { t: "state", on: pageOn });
+    port.onMessage.addListener((message) => {
+        if (!message || typeof message.n !== "number") return;
+        pageCall(message.action, message.payload, streams).then(
+            (data) => post(port, { n: message.n, ok: true, data }),
+            (err) => {
+                // An engine older than this extension refuses these commands: stop routing pages through it.
+                if (err.code === "FORBIDDEN" && message.action === "decide") {
+                    browserCommands = false;
+                    getState().then(pushPageState);
+                }
+                post(port, { n: message.n, ok: false, error: String(err.message || err) });
+            },
+        );
+    });
+    port.onDisconnect.addListener(() => {
+        pagePorts.delete(port);
+        for (const id of streams) rpc("browser.cancel", { id }).catch(() => { });
+    });
 });
 
 // ── Proxy failure handling ────────────────────────────────────────────────────

@@ -1,0 +1,13 @@
+{
+    "name": "bifurc-companion-e2e",
+    "private": true,
+    "type": "module",
+    "description": "End-to-end check of HTTPS routing through the extension; see run.mjs",
+    "scripts": {
+        "test": "node run.mjs"
+    },
+    "devDependencies": {
+        "playwright-core": "1.56.1",
+        "ws": "8.18.3"
+    }
+}

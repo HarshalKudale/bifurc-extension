@@ -92,4 +92,542 @@
         if (on === null) await known;
         return on;
     }
+
+    // ── Bodies, headers and answers ───────────────────────────────────────────
+
+    /** How much of a body the capture keeps (`MAX_LOGGED_BODY_BYTES` in the engine). */
+    const MAX_LOGGED = 512 * 1024;
+    const NULL_BODY = new Set([101, 103, 204, 205, 304]);
+    const nativeFetch = window.fetch;
+
+    function toBase64(bytes) {
+        let binary = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) {
+            binary += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        }
+        return btoa(binary);
+    }
+
+    function fromBase64(text) {
+        const binary = atob(text || "");
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+        return bytes;
+    }
+
+    function concat(parts) {
+        const out = new Uint8Array(parts.reduce((sum, part) => sum + part.length, 0));
+        let at = 0;
+        for (const part of parts) {
+            out.set(part, at);
+            at += part.length;
+        }
+        return out;
+    }
+
+    function headerObject(headers) {
+        const out = {};
+        headers.forEach((value, name) => { out[name] = value; });
+        return out;
+    }
+
+    /** What the browser adds to a request itself, which the page's own request does not show. */
+    function withBrowserHeaders(headers, url, referrer, method) {
+        const crossOrigin = new URL(url).origin !== location.origin;
+        headers["user-agent"] ??= navigator.userAgent;
+        headers["accept"] ??= "*/*";
+        if (crossOrigin || !["GET", "HEAD"].includes(method)) headers["origin"] ??= location.origin;
+        // The default policy (strict-origin-when-cross-origin) sends only the origin across origins.
+        if (referrer === "about:client") {
+            headers["referer"] ??= crossOrigin ? `${location.origin}/` : location.href.split("#")[0];
+        } else if (referrer) {
+            headers["referer"] ??= referrer;
+        }
+        return headers;
+    }
+
+    function abortError(signal) {
+        return signal.reason ?? new DOMException("The operation was aborted.", "AbortError");
+    }
+
+    /** A relayed body, pulled from the engine as the page reads it. */
+    function relayBody(id, signal) {
+        let controller;
+        const abort = () => {
+            tell("cancel", { id });
+            try { controller.error(abortError(signal)); } catch { /* already closed */ }
+        };
+        return new ReadableStream({
+            start(c) {
+                controller = c;
+                signal?.addEventListener("abort", abort, { once: true });
+            },
+            async pull(c) {
+                for (;;) {
+                    const read = await call("read", { id });
+                    for (const chunk of read.chunks) c.enqueue(fromBase64(chunk));
+                    if (read.done) {
+                        signal?.removeEventListener("abort", abort);
+                        if (read.error) c.error(new TypeError("network error"));
+                        else c.close();
+                        return;
+                    }
+                    if (read.chunks.length) return;
+                }
+            },
+            cancel() {
+                signal?.removeEventListener("abort", abort);
+                tell("cancel", { id });
+            },
+        });
+    }
+
+    /** The page's Response for an answer the engine gave. */
+    function pageResponse(decision, request, body) {
+        const { status } = decision;
+        const empty = NULL_BODY.has(status) || request.method === "HEAD";
+        if (status < 200 || status > 599 || (empty && decision.action === "relay")) {
+            if (decision.action === "relay") tell("cancel", { id: decision.id });
+            if (status < 200 || status > 599) throw new TypeError("Failed to fetch");
+        }
+        const headers = new Headers();
+        for (const [name, value] of decision.headers) {
+            try { headers.append(name, value); } catch { /* a header a page can never see */ }
+        }
+        const response = new Response(empty ? null : body, { status, headers });
+        Object.defineProperty(response, "url", { value: request.url });
+        return response;
+    }
+
+    /**
+     * Ask the engine about `request`. Resolves to the Response for an answer it gave, or to `{ continueId }`
+     * when the browser should send the request itself (`null` when the engine could not be asked).
+     */
+    async function askEngine(request, signal) {
+        const bytes = ["GET", "HEAD"].includes(request.method) ? null : new Uint8Array(await request.arrayBuffer());
+        const headers = withBrowserHeaders(headerObject(request.headers), request.url, request.referrer, request.method);
+        let decision;
+        try {
+            decision = await call("decide", {
+                method: request.method,
+                url: request.url,
+                headers,
+                body: bytes && bytes.length ? toBase64(bytes) : "",
+                credentials: request.credentials,
+            });
+        } catch {
+            return { continueId: null };
+        }
+        if (signal?.aborted) {
+            if (decision.id) tell("cancel", { id: decision.id });
+            throw abortError(signal);
+        }
+        switch (decision.action) {
+            case "respond":
+                return pageResponse(decision, request, fromBase64(decision.body));
+            case "relay":
+                return pageResponse(decision, request, relayBody(decision.id, signal));
+            case "continue":
+                return { continueId: decision.id };
+        }
+        throw new TypeError("Failed to fetch");
+    }
+
+    /** The events of an event stream, fed its bytes as they arrive. `retry` is the last reconnection time it set. */
+    function eventParser(onEvent) {
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let data = [];
+        let type = "";
+        let hasData = false;
+        const parser = { lastId: "", retry: null };
+        const line = (text) => {
+            if (text === "") {
+                if (hasData) onEvent({ type: type || "message", data: data.join("\n"), id: parser.lastId });
+                data = [];
+                type = "";
+                hasData = false;
+                return;
+            }
+            if (text[0] === ":") return;
+            const colon = text.indexOf(":");
+            const field = colon < 0 ? text : text.slice(0, colon);
+            let value = colon < 0 ? "" : text.slice(colon + 1);
+            if (value[0] === " ") value = value.slice(1);
+            if (field === "data") {
+                data.push(value);
+                hasData = true;
+            } else if (field === "event") {
+                type = value;
+            } else if (field === "id" && !value.includes("\0")) {
+                parser.lastId = value;
+            } else if (field === "retry" && /^\d+$/.test(value)) {
+                parser.retry = Number(value);
+            }
+        };
+        parser.feed = (bytes) => {
+            buffer += decoder.decode(bytes, { stream: true });
+            let start = 0;
+            for (let i = 0; i < buffer.length; i++) {
+                const c = buffer[i];
+                if (c !== "\n" && c !== "\r") continue;
+                // A \r\n can be split across two chunks.
+                if (c === "\r" && i + 1 === buffer.length) break;
+                line(buffer.slice(start, i));
+                if (c === "\r" && buffer[i + 1] === "\n") i++;
+                start = i + 1;
+            }
+            buffer = buffer.slice(start);
+        };
+        return parser;
+    }
+
+    /** Report to the capture what came back for a request the browser sent itself. */
+    function mirrorResponse(id, response) {
+        const sse = (response.headers.get("content-type") || "").includes("text/event-stream");
+        tell("open", { id, status: response.status, headers: headerObject(response.headers), kind: sse ? "sse" : undefined });
+        if (!response.body) {
+            tell("close", { id, body: "" });
+            return;
+        }
+        mirrorBody(id, response.clone().body, sse);
+    }
+
+    async function mirrorBody(id, body, sse) {
+        const reader = body.getReader();
+        const kept = [];
+        let size = 0;
+        const events = sse && eventParser((event) => tell("message", {
+            id,
+            message: { direction: "received", data: event.data, event: event.type, eventId: event.id },
+        }));
+        try {
+            for (;;) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (size < MAX_LOGGED) {
+                    const part = value.subarray(0, MAX_LOGGED - size);
+                    kept.push(part);
+                    size += part.length;
+                }
+                if (events) {
+                    events.feed(value);
+                } else if (size >= MAX_LOGGED) {
+                    reader.cancel();
+                    break;
+                }
+            }
+        } catch { /* the page aborted or the connection dropped: what arrived is logged */ }
+        tell("close", { id, body: toBase64(concat(kept)) });
+    }
+
+    // ── fetch ─────────────────────────────────────────────────────────────────
+
+    async function fetchThroughEngine(request) {
+        if (!(await routed(request.url))) return nativeFetch.call(window, request);
+        const native = request.clone();
+        const answer = await askEngine(request, request.signal);
+        if (answer instanceof Response) return answer;
+        if (answer.continueId === null) return nativeFetch.call(window, native);
+        let response;
+        try {
+            response = await nativeFetch.call(window, native);
+        } catch (error) {
+            // No answer: the capture shows the request as failed.
+            tell("close", { id: answer.continueId });
+            throw error;
+        }
+        mirrorResponse(answer.continueId, response);
+        return response;
+    }
+
+    window.fetch = function fetch(input, init) {
+        if (on === false) return nativeFetch.apply(this, arguments);
+        let request;
+        try {
+            request = new Request(input, init);
+        } catch {
+            return nativeFetch.apply(this, arguments);
+        }
+        // `new Request` took the input's body, so from here on only `request` can be sent.
+        if (request.keepalive || request.mode === "no-cors" || !/^https:/i.test(request.url)) {
+            return nativeFetch.call(window, request);
+        }
+        return fetchThroughEngine(request);
+    };
+
+    // ── XMLHttpRequest ────────────────────────────────────────────────────────
+    //
+    // A subclass, so `instanceof` and everything the engine does not answer stay
+    // native. While the engine answers, the getters read that answer and the
+    // events are dispatched on the object itself. A request the browser sends
+    // itself goes out through the native send once the engine said so.
+
+    const NativeXHR = window.XMLHttpRequest;
+    const TEXT_TYPES = new Set(["", "text"]);
+
+    function charsetOf(mime) {
+        const match = /charset=([^;]+)/i.exec(mime || "");
+        try {
+            return new TextDecoder(match ? match[1].trim().replace(/"/g, "") : "utf-8");
+        } catch {
+            return new TextDecoder();
+        }
+    }
+
+    function headerBlock(text) {
+        const out = {};
+        for (const line of text.trim().split(/\r?\n/)) {
+            const colon = line.indexOf(":");
+            if (colon > 0) out[line.slice(0, colon).trim().toLowerCase()] = line.slice(colon + 1).trim();
+        }
+        return out;
+    }
+
+    class XMLHttpRequest extends NativeXHR {
+        #request = null;
+        #headers = {};
+        #mimeOverride = null;
+        /** The engine's answer while it gives one: readyState, status, headers, parts, finished. */
+        #answer = null;
+        #controller = null;
+
+        open(method, url, async, user, password) {
+            super.open(...arguments);
+            // Opening again ends the request the engine was still answering.
+            if (this.#answer && !this.#answer.finished) {
+                this.#answer.finished = true;
+                this.#controller.abort();
+            }
+            this.#request = {
+                method: String(method).toUpperCase(),
+                url: new URL(url, document.baseURI).href,
+                async: arguments.length < 3 || !!async,
+                withUser: user != null || password != null,
+            };
+            this.#headers = {};
+            this.#answer = null;
+        }
+
+        setRequestHeader(name, value) {
+            super.setRequestHeader(name, value);
+            const key = String(name).toLowerCase();
+            this.#headers[key] = key in this.#headers ? `${this.#headers[key]}, ${value}` : String(value);
+        }
+
+        overrideMimeType(mime) {
+            super.overrideMimeType(mime);
+            this.#mimeOverride = String(mime);
+        }
+
+        send(body) {
+            const r = this.#request;
+            // Synchronous XHR cannot wait for the engine.
+            if (on !== true || !r || !r.async || r.withUser || !/^https:/i.test(r.url) || super.readyState !== 1) {
+                return super.send(body);
+            }
+            this.#takeOver(body ?? null);
+        }
+
+        abort() {
+            const a = this.#answer;
+            if (!a || a.finished) return super.abort();
+            this.#controller.abort();
+            this.#finish("abort");
+            a.readyState = 0;
+        }
+
+        async #takeOver(body) {
+            const r = this.#request;
+            const a = (this.#answer = { readyState: 1, status: 0, headers: [], parts: [], finished: false, text: null });
+            const init = { method: r.method, headers: this.#headers, credentials: this.withCredentials ? "include" : "same-origin" };
+            if (body !== null && !["GET", "HEAD"].includes(r.method)) {
+                init.body = body instanceof Document ? new XMLSerializer().serializeToString(body) : body;
+            }
+            let request;
+            try {
+                request = new Request(r.url, init);
+            } catch {
+                this.#answer = null;
+                return super.send(body);
+            }
+            const controller = (this.#controller = new AbortController());
+            if (this.timeout > 0) {
+                a.timer = setTimeout(() => {
+                    controller.abort();
+                    this.#finish("timeout");
+                }, this.timeout);
+            }
+            let answer;
+            try {
+                answer = await askEngine(request, controller.signal);
+            } catch {
+                if (this.#answer === a) this.#finish("error");
+                return;
+            }
+            if (a.finished) return;
+            if (!(answer instanceof Response)) {
+                clearTimeout(a.timer);
+                this.#answer = null;
+                if (answer.continueId) this.#mirror(answer.continueId);
+                return super.send(body);
+            }
+            await this.#deliver(answer, init.body !== undefined);
+        }
+
+        async #deliver(response, uploaded) {
+            const a = this.#answer;
+            this.#progress(this, "loadstart", 0, 0);
+            if (uploaded) for (const type of ["loadstart", "progress", "load", "loadend"]) this.#progress(this.upload, type, 0, 0);
+            a.status = response.status;
+            a.headers = [...response.headers];
+            this.#setState(2);
+            const total = Number(response.headers.get("content-length")) || 0;
+            let loaded = 0;
+            try {
+                const reader = response.body?.getReader();
+                while (reader) {
+                    const { value, done } = await reader.read();
+                    if (a.finished) return;
+                    if (done) break;
+                    a.parts.push(value);
+                    a.text = null;
+                    loaded += value.length;
+                    this.#setState(3);
+                    this.#progress(this, "progress", loaded, total);
+                }
+            } catch {
+                if (this.#answer === a) this.#finish("error");
+                return;
+            }
+            this.#finish("load", loaded, total);
+        }
+
+        #setState(state) {
+            this.#answer.readyState = state;
+            this.dispatchEvent(new Event("readystatechange"));
+        }
+
+        #progress(target, type, loaded, total) {
+            target.dispatchEvent(new ProgressEvent(type, { lengthComputable: total > 0, loaded, total }));
+        }
+
+        /** The end of an answer the engine gave: `load`, or `error` / `abort` / `timeout` with no response. */
+        #finish(type, loaded = 0, total = 0) {
+            const a = this.#answer;
+            if (!a || a.finished) return;
+            a.finished = true;
+            clearTimeout(a.timer);
+            if (type !== "load") Object.assign(a, { status: 0, headers: [], parts: [], text: null });
+            this.#setState(4);
+            this.#progress(this, type, loaded, total);
+            this.#progress(this, "loadend", loaded, total);
+        }
+
+        #mime() {
+            const a = this.#answer;
+            return this.#mimeOverride || (a.headers.find(([name]) => name === "content-type") || [])[1] || "";
+        }
+
+        #text() {
+            const a = this.#answer;
+            a.text ??= charsetOf(this.#mime()).decode(concat(a.parts));
+            return a.text;
+        }
+
+        get readyState() { return this.#answer ? this.#answer.readyState : super.readyState; }
+        get status() { return this.#answer ? this.#answer.status : super.status; }
+        get statusText() { return this.#answer ? "" : super.statusText; }
+
+        get responseURL() {
+            if (!this.#answer) return super.responseURL;
+            return this.#answer.readyState >= 2 && this.#answer.status ? this.#request.url : "";
+        }
+
+        getResponseHeader(name) {
+            const a = this.#answer;
+            if (!a) return super.getResponseHeader(name);
+            const wanted = String(name).toLowerCase();
+            const values = a.readyState < 2 ? [] : a.headers.filter(([n]) => n === wanted).map(([, v]) => v);
+            return values.length ? values.join(", ") : null;
+        }
+
+        getAllResponseHeaders() {
+            const a = this.#answer;
+            if (!a) return super.getAllResponseHeaders();
+            return a.readyState < 2 ? "" : a.headers.map(([name, value]) => `${name}: ${value}\r\n`).join("");
+        }
+
+        get responseText() {
+            if (!this.#answer) return super.responseText;
+            if (!TEXT_TYPES.has(this.responseType)) {
+                throw new DOMException("responseText is only for a text responseType", "InvalidStateError");
+            }
+            return this.#answer.readyState >= 3 ? this.#text() : "";
+        }
+
+        get response() {
+            const a = this.#answer;
+            if (!a) return super.response;
+            const type = this.responseType;
+            if (TEXT_TYPES.has(type)) return a.readyState >= 3 ? this.#text() : "";
+            if (a.readyState !== 4 || a.status === 0) return null;
+            switch (type) {
+                case "json":
+                    try { return JSON.parse(this.#text()); } catch { return null; }
+                case "arraybuffer":
+                    return concat(a.parts).buffer;
+                case "blob":
+                    return new Blob(a.parts, { type: this.#mime() });
+                case "document":
+                    return this.#document();
+            }
+            return null;
+        }
+
+        get responseXML() {
+            const a = this.#answer;
+            if (!a) return super.responseXML;
+            if (!["", "document"].includes(this.responseType)) {
+                throw new DOMException("responseXML is only for a document responseType", "InvalidStateError");
+            }
+            return a.readyState === 4 && a.status ? this.#document() : null;
+        }
+
+        #document() {
+            const mime = this.#mime();
+            const kind = /html/i.test(mime) ? "text/html" : /xml/i.test(mime) ? "application/xml" : null;
+            return kind ? new DOMParser().parseFromString(this.#text(), kind) : null;
+        }
+
+        /** Report to the capture what came back for a request the native send made. */
+        #mirror(id) {
+            let opened = false;
+            const open = () => {
+                if (opened || super.readyState < 2) return;
+                opened = true;
+                tell("open", { id, status: super.status, headers: headerBlock(super.getAllResponseHeaders()) });
+            };
+            this.addEventListener("readystatechange", open);
+            this.addEventListener("loadend", async () => {
+                this.removeEventListener("readystatechange", open);
+                if (super.status === 0) {
+                    tell("close", { id });
+                    return;
+                }
+                open();
+                let bytes = new Uint8Array(0);
+                try {
+                    const type = super.responseType;
+                    if (TEXT_TYPES.has(type)) bytes = new TextEncoder().encode(super.responseText);
+                    else if (type === "json") bytes = new TextEncoder().encode(JSON.stringify(super.response));
+                    else if (type === "arraybuffer") bytes = new Uint8Array(super.response);
+                    else if (type === "blob") bytes = new Uint8Array(await super.response.arrayBuffer());
+                } catch { /* the body stays out of the capture */ }
+                tell("close", { id, body: toBase64(bytes.subarray(0, MAX_LOGGED)) });
+            }, { once: true });
+        }
+    }
+
+    window.XMLHttpRequest = XMLHttpRequest;
 })();

@@ -49,6 +49,16 @@ const tls = { key: readFileSync(join(certDir, "key.pem")), cert: readFileSync(jo
 const site = https.createServer(tls, (req, res) => {
     if (req.url === "/") return res.end("<!doctype html><title>site</title><p>site");
     if (req.url === "/data") return res.end(JSON.stringify({ from: "site" }));
+    // A script a site loads with fetch, with and without the .js a URL usually tells it by.
+    if (req.url === "/app.js" || req.url === "/bundle") {
+        res.writeHead(200, { "content-type": "application/javascript" });
+        return res.end("console.log(1)");
+    }
+    // Readable from another origin, with a header the page is not allowed to see.
+    if (req.url === "/cors") {
+        res.writeHead(200, { "access-control-allow-origin": "*", "content-type": "application/json", "x-hidden": "seen" });
+        return res.end("{}");
+    }
     if (req.url === "/upload") {
         let body = "";
         req.on("data", (c) => (body += c));
@@ -118,7 +128,7 @@ engine.stdout.on("data", (c) => (engineLog += c));
 engine.stderr.on("data", (c) => (engineLog += c));
 const cli = (...args) => execFileSync(join(BIFURC, `bifurc${EXE}`), ["--data-dir", data, "--no-start", ...args], { env, encoding: "utf8" });
 for (let i = 0; ; i++) {
-    try { cli("status"); break; } catch (e) { if (i > 60) throw new Error(`engine did not start:\n${engineLog}`); }
+    try { cli("status"); break; } catch (e) { if (i > 60) throw new Error(`engine did not answer: ${e.stderr || e.message}\n${engineLog}`); }
     await new Promise((r) => setTimeout(r, 500));
 }
 cli("workspaces", "create", "e2e");
@@ -220,6 +230,23 @@ await check("fetch POST passthrough body", async () => {
     expect(await inPage(() => fetch("/upload", { method: "POST", body: "hello" }).then((r) => r.text())), "got:hello");
     const hit = await waitCapture((e) => e.url.endsWith("/upload"), "/upload");
     return `captured status=${hit.status}`;
+});
+await check("site scripts stay out of capture", async () => {
+    const got = await inPage(() => Promise.all(["/app.js", "/bundle"].map((u) => fetch(u).then((r) => r.text()))));
+    expect(got.join("|"), "console.log(1)|console.log(1)");
+    await new Promise((r) => setTimeout(r, 1000));
+    const hit = captured((e) => e.url.endsWith("/app.js") || e.url.endsWith("/bundle"));
+    if (hit) throw new Error(`captured ${hit.url}`);
+    return "neither captured";
+});
+await check("cross-origin answer keeps its hidden headers", async () => {
+    const seen = await inPage(() => fetch(`https://localhost:${location.port}/cors`).then((r) => r.headers.get("x-hidden")));
+    expect(seen, null);
+    const hit = await waitCapture((e) => e.url.endsWith("/cors") && e.status === 200, "/cors");
+    const shown = JSON.parse(cli("capture", "show", hit.id, "--headers", "--json"));
+    const headers = shown.headers || {};
+    if (!headers["x-hidden"]) throw new Error(`no x-hidden in ${JSON.stringify(shown).slice(0, 600)}`);
+    return expect(headers["x-hidden"], "seen") + " (hidden from the page, shown in capture)";
 });
 await check("xhr passthrough", async () => expect(await inPage(() => new Promise((resolve) => {
     const x = new XMLHttpRequest();

@@ -692,6 +692,53 @@ async function applySetCookies(decision, url, storeId) {
     decision.headers = kept;
 }
 
+// ── Response headers for requests the browser sends itself ──
+//
+// A page reading a cross-origin answer sees only the CORS-safelisted headers,
+// so what the capture shows of an answer comes from here: the browser reports
+// every request's response headers, and each report is kept briefly for the
+// page's own report of the same request.
+
+const HEADERS_KEPT_MS = 30000;
+const answered = new Map(); // "tab method url" -> [{ at, headers }]
+
+chrome.webRequest.onResponseStarted.addListener((details) => {
+    if (!pageOn || details.tabId < 0) return;
+    const key = `${details.tabId} ${details.method} ${details.url}`;
+    const list = answered.get(key) || [];
+    list.push({ at: Date.now(), headers: details.responseHeaders || [] });
+    answered.set(key, list);
+    if (answered.size > 500) {
+        const old = Date.now() - HEADERS_KEPT_MS;
+        for (const [k, l] of answered) if (l.every((r) => r.at < old)) answered.delete(k);
+    }
+}, { urls: ["https://*/*"], types: ["xmlhttprequest"] }, IS_FIREFOX ? ["responseHeaders"] : ["responseHeaders", "extraHeaders"]);
+
+/**
+ * The browser's own record of an answer's headers, as the engine logs them (set-cookie lines joined with
+ * newlines, repeats with commas), waiting briefly in case its report has not arrived yet. `null` when it never
+ * comes (an answer from a service worker or a cache the browser does not report).
+ */
+async function answerHeaders(tabId, method, url) {
+    const key = `${tabId} ${method} ${url}`;
+    for (let waited = 0; waited <= 300; waited += 25) {
+        const list = answered.get(key);
+        if (list && list.length) {
+            const { headers } = list.shift();
+            if (!list.length) answered.delete(key);
+            const out = {};
+            for (const { name, value } of headers) {
+                const lower = name.toLowerCase();
+                const v = value ?? "";
+                out[lower] = lower in out ? `${out[lower]}${lower === "set-cookie" ? "\n" : ", "}${v}` : v;
+            }
+            return out;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    return null;
+}
+
 /** The streams a decision opens: the id the page reads, reports or cancels against. */
 function streamOf(decision) {
     return decision && ["relay", "socket", "continue"].includes(decision.action) ? decision.id : null;
@@ -729,6 +776,10 @@ async function pageCall(action, payload, streams, sender) {
         }
         case "open": {
             const open = { id, status: Number.isInteger(payload.status) ? payload.status : 0, headers: stringMap(payload.headers) };
+            const tabId = sender.tab && sender.tab.id;
+            if (tabId !== undefined && typeof payload.url === "string" && typeof payload.method === "string") {
+                open.headers = (await answerHeaders(tabId, payload.method, payload.url)) || open.headers;
+            }
             if (payload.kind === "sse" || payload.kind === "ws") open.kind = payload.kind;
             return rpc("browser.open", open);
         }

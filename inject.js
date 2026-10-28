@@ -95,9 +95,23 @@
         }
     }
 
+    // A site's own files (scripts, styles, images, fonts, media, pages) stay the browser's: the extension only
+    // routes the calls a site makes for its data. One a site fetches is known by its extension before it is sent
+    // and by its content type once it is answered.
+    const ASSET_PATH = /\.(m?js|cjs|css|map|png|jpe?g|gif|webp|avif|svg|ico|bmp|woff2?|ttf|otf|eot|wasm|mp4|webm|mp3|ogg|wav)$/i;
+    const ASSET_TYPE = /^\s*(text\/(css|html)|image\/|font\/|audio\/|video\/|application\/(wasm|xhtml\+xml|vnd\.ms-fontobject|font-)|[^;]*(javascript|ecmascript))/i;
+
+    function isAsset(url) {
+        try {
+            return ASSET_PATH.test(new URL(url).pathname);
+        } catch {
+            return false;
+        }
+    }
+
     /** Whether a request to `url` goes through the engine, waiting briefly for the first state. */
     async function routed(url) {
-        if (!/^(https|wss):/i.test(url)) return false;
+        if (!/^(https|wss):/i.test(url) || isAsset(url)) return false;
         if (on === null) await known;
         return on;
     }
@@ -292,10 +306,25 @@
         return parser;
     }
 
-    /** Report to the capture what came back for a request the browser sent itself. */
-    function mirrorResponse(id, response) {
-        const sse = (response.headers.get("content-type") || "").includes("text/event-stream");
-        tell("open", { id, status: response.status, headers: headerObject(response.headers), kind: sse ? "sse" : undefined });
+    /**
+     * Report to the capture what came back for a request the browser sent itself, unless it is one of the site's
+     * own files. `url` and `method` let the extension fill in the headers a cross-origin answer hides from the page.
+     */
+    function mirrorResponse(id, response, method) {
+        const type = response.headers.get("content-type") || "";
+        if (ASSET_TYPE.test(type)) {
+            tell("cancel", { id });
+            return;
+        }
+        const sse = type.includes("text/event-stream");
+        tell("open", {
+            id,
+            status: response.status,
+            headers: headerObject(response.headers),
+            kind: sse ? "sse" : undefined,
+            url: response.url,
+            method,
+        });
         if (!response.body) {
             tell("close", { id, body: "" });
             return;
@@ -347,7 +376,7 @@
             tell("close", { id: answer.continueId });
             throw error;
         }
-        mirrorResponse(answer.continueId, response);
+        mirrorResponse(answer.continueId, response, request.method);
         return response;
     }
 
@@ -433,7 +462,7 @@
         send(body) {
             const r = this.#request;
             // Synchronous XHR cannot wait for the engine.
-            if (on !== true || !r || !r.async || r.withUser || !/^https:/i.test(r.url) || super.readyState !== 1) {
+            if (on !== true || !r || !r.async || r.withUser || !/^https:/i.test(r.url) || isAsset(r.url) || super.readyState !== 1) {
                 return super.send(body);
             }
             this.#takeOver(body ?? null);
@@ -613,19 +642,33 @@
         /** Report to the capture what came back for a request the native send made. */
         #mirror(id) {
             let opened = false;
+            let skipped = false;
             const open = () => {
-                if (opened || super.readyState < 2) return;
+                if (opened || skipped || super.readyState < 2) return;
+                if (ASSET_TYPE.test(super.getResponseHeader("content-type") || "")) {
+                    skipped = true;
+                    tell("cancel", { id });
+                    return;
+                }
                 opened = true;
-                tell("open", { id, status: super.status, headers: headerBlock(super.getAllResponseHeaders()) });
+                tell("open", {
+                    id,
+                    status: super.status,
+                    headers: headerBlock(super.getAllResponseHeaders()),
+                    url: super.responseURL,
+                    method: this.#request.method,
+                });
             };
             this.addEventListener("readystatechange", open);
             this.addEventListener("loadend", async () => {
                 this.removeEventListener("readystatechange", open);
+                // A failed request (status 0) is logged as failed, not as answered.
+                if (super.status !== 0) open();
+                if (skipped) return;
                 if (super.status === 0) {
                     tell("close", { id });
                     return;
                 }
-                open();
                 let bytes = new Uint8Array(0);
                 try {
                     const type = super.responseType;

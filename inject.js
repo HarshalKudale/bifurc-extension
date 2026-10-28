@@ -630,4 +630,352 @@
     }
 
     window.XMLHttpRequest = XMLHttpRequest;
+
+    // ── EventSource and WebSocket ─────────────────────────────────────────────
+    //
+    // Stand-ins: the engine has to be asked before anything is opened, which a
+    // native object cannot wait for. Where the page is not routed, the
+    // constructor returns the native object itself. Either way `instanceof`
+    // holds for both kinds.
+
+    /** `on<type>` properties that behave as event handler attributes do. */
+    function handlerProperties(proto, types) {
+        for (const type of types) {
+            const handler = Symbol(type);
+            const listening = Symbol(`${type} listening`);
+            Object.defineProperty(proto, `on${type}`, {
+                configurable: true,
+                enumerable: true,
+                get() { return this[handler] ?? null; },
+                set(fn) {
+                    if (!this[listening]) {
+                        this[listening] = true;
+                        this.addEventListener(type, (event) => this[handler]?.call(this, event));
+                    }
+                    this[handler] = typeof fn === "function" ? fn : null;
+                },
+            });
+        }
+    }
+
+    function keepInstanceof(Patched, Native) {
+        Object.setPrototypeOf(Patched.prototype, Native.prototype);
+        Object.defineProperty(Patched, Symbol.hasInstance, { value: (value) => value instanceof Native });
+    }
+
+    const NativeEventSource = window.EventSource;
+
+    class EventSource extends EventTarget {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSED = 2;
+        #url;
+        #withCredentials;
+        #readyState = 0;
+        #controller = null;
+        #lastId = "";
+        #retry = 3000;
+
+        constructor(url, init) {
+            let href = null;
+            try { href = new URL(url, document.baseURI).href; } catch { /* the native constructor says why */ }
+            if (arguments.length === 0 || on !== true || !href || !/^https:/i.test(href)) {
+                return new NativeEventSource(...arguments);
+            }
+            super();
+            this.#url = href;
+            this.#withCredentials = !!(init && init.withCredentials);
+            this.#connect();
+        }
+
+        get url() { return this.#url; }
+        get withCredentials() { return this.#withCredentials; }
+        get readyState() { return this.#readyState; }
+
+        close() {
+            this.#readyState = 2;
+            this.#controller?.abort();
+        }
+
+        async #connect() {
+            const controller = (this.#controller = new AbortController());
+            const headers = { accept: "text/event-stream", "cache-control": "no-cache" };
+            if (this.#lastId) headers["last-event-id"] = this.#lastId;
+            let response;
+            try {
+                response = await fetchThroughEngine(new Request(this.#url, {
+                    headers,
+                    cache: "no-store",
+                    credentials: this.#withCredentials ? "include" : "same-origin",
+                    signal: controller.signal,
+                }));
+            } catch {
+                this.#reconnect();
+                return;
+            }
+            if (this.#readyState === 2) return;
+            const type = (response.headers.get("content-type") || "").toLowerCase();
+            if (response.status !== 200 || !type.startsWith("text/event-stream")) {
+                // Not an event stream: the connection fails for good.
+                response.body?.cancel();
+                this.#readyState = 2;
+                this.dispatchEvent(new Event("error"));
+                return;
+            }
+            this.#readyState = 1;
+            this.dispatchEvent(new Event("open"));
+            const origin = new URL(this.#url).origin;
+            const parser = eventParser((event) => {
+                this.#lastId = event.id;
+                if (this.#readyState === 1) {
+                    this.dispatchEvent(new MessageEvent(event.type, { data: event.data, lastEventId: event.id, origin }));
+                }
+            });
+            parser.lastId = this.#lastId;
+            try {
+                const reader = response.body.getReader();
+                for (;;) {
+                    const { value, done } = await reader.read();
+                    if (done) break;
+                    parser.feed(value);
+                    if (parser.retry !== null) this.#retry = parser.retry;
+                }
+            } catch { /* closed by the page, or the connection dropped */ }
+            this.#reconnect();
+        }
+
+        /** The stream ended: try again after the retry time, unless the page closed it (also from onerror). */
+        #reconnect() {
+            if (this.#readyState === 2) return;
+            this.#readyState = 0;
+            this.dispatchEvent(new Event("error"));
+            if (this.#readyState === 2) return;
+            setTimeout(() => { if (this.#readyState === 0) this.#connect(); }, this.#retry);
+        }
+    }
+    handlerProperties(EventSource.prototype, ["open", "message", "error"]);
+    keepInstanceof(EventSource, NativeEventSource);
+    window.EventSource = EventSource;
+
+    const NativeWebSocket = window.WebSocket;
+    const TOKEN = /^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$/;
+
+    function byteSize(data) {
+        if (typeof data === "string") return new TextEncoder().encode(data).length;
+        return data instanceof Blob ? data.size : data.byteLength;
+    }
+
+    /** A WebSocket message as the engine takes it: text as is, anything else as base64. */
+    async function frameOf(data, direction, cap = Infinity) {
+        if (typeof data === "string") return { direction, data };
+        let bytes;
+        if (data instanceof Blob) bytes = new Uint8Array(await data.arrayBuffer());
+        else if (ArrayBuffer.isView(data)) bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        else bytes = new Uint8Array(data);
+        return { direction, data: toBase64(bytes.subarray(0, cap)), binary: true };
+    }
+
+    class WebSocket extends EventTarget {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSING = 2;
+        static CLOSED = 3;
+        #url;
+        #protocol = "";
+        #extensions = "";
+        #binaryType = "blob";
+        #readyState = 0;
+        #buffered = 0;
+        /** The engine's relay, when a rule claimed the socket. */
+        #id = null;
+        /** The browser's own socket, when nothing did; `#mirrorId` reports it to the capture. */
+        #native = null;
+        #mirrorId = null;
+        #sending = Promise.resolve();
+        #closeAsked = false;
+
+        constructor(url, protocols) {
+            let target = null;
+            try {
+                target = new URL(url, document.baseURI);
+                if (target.protocol === "https:") target.protocol = "wss:";
+            } catch { /* the native constructor says why */ }
+            const list = protocols === undefined ? [] : typeof protocols === "string" ? [protocols] : [...protocols];
+            const valid = list.every((p) => TOKEN.test(p)) && new Set(list).size === list.length;
+            if (arguments.length === 0 || on !== true || !target || target.protocol !== "wss:" || target.hash || !valid) {
+                return new NativeWebSocket(...arguments);
+            }
+            super();
+            this.#url = target.href;
+            this.#connect(list);
+        }
+
+        get url() { return this.#url; }
+        get readyState() { return this.#readyState; }
+        get protocol() { return this.#protocol; }
+        get extensions() { return this.#extensions; }
+        get bufferedAmount() { return this.#native ? this.#native.bufferedAmount : this.#buffered; }
+        get binaryType() { return this.#binaryType; }
+        set binaryType(value) {
+            if (value === "blob" || value === "arraybuffer") this.#binaryType = value;
+        }
+
+        async #connect(protocols) {
+            const headers = { "user-agent": navigator.userAgent, origin: location.origin };
+            if (protocols.length) headers["sec-websocket-protocol"] = protocols.join(", ");
+            let decision = null;
+            try {
+                decision = await call("decide", { method: "GET", url: this.#url, headers, body: "", credentials: "include" });
+            } catch { /* the browser opens it */ }
+            if (this.#closeAsked) {
+                if (decision?.id) tell("cancel", { id: decision.id });
+                this.#fail();
+                return;
+            }
+            if (!decision || decision.action === "continue") {
+                this.#openNative(protocols, decision?.id ?? null);
+                return;
+            }
+            if (decision.action !== "socket") {
+                // The target refused the upgrade, or a fault dropped it.
+                this.#fail();
+                return;
+            }
+            this.#id = decision.id;
+            this.#protocol = (decision.headers.find(([name]) => name === "sec-websocket-protocol") || [])[1] || "";
+            this.#readyState = 1;
+            this.dispatchEvent(new Event("open"));
+            this.#pump();
+        }
+
+        #openNative(protocols, mirrorId) {
+            let socket;
+            try {
+                socket = new NativeWebSocket(this.#url, protocols);
+            } catch {
+                if (mirrorId) tell("close", { id: mirrorId });
+                this.#fail();
+                return;
+            }
+            socket.binaryType = "arraybuffer";
+            this.#native = socket;
+            this.#mirrorId = mirrorId;
+            socket.addEventListener("open", () => {
+                this.#protocol = socket.protocol;
+                this.#extensions = socket.extensions;
+                this.#readyState = 1;
+                if (mirrorId) tell("open", { id: mirrorId, status: 101, headers: {}, kind: "ws" });
+                this.dispatchEvent(new Event("open"));
+            });
+            socket.addEventListener("message", (event) => {
+                const data = typeof event.data === "string" ? event.data : new Uint8Array(event.data);
+                if (mirrorId) frameOf(data, "received", MAX_LOGGED).then((message) => tell("message", { id: mirrorId, message }));
+                this.#deliver(data, event.origin);
+            });
+            socket.addEventListener("error", () => this.dispatchEvent(new Event("error")));
+            socket.addEventListener("close", (event) => {
+                if (mirrorId) {
+                    tell("message", { id: mirrorId, message: { direction: "received", data: event.reason, close: event.code } });
+                    tell("close", { id: mirrorId });
+                }
+                this.#closed(event.code, event.reason, event.wasClean);
+            });
+        }
+
+        /** Frames from the rule's target, until the relay ends. */
+        async #pump() {
+            const origin = new URL(this.#url).origin;
+            let closing = null;
+            let broken = false;
+            try {
+                for (;;) {
+                    const read = await call("read", { id: this.#id });
+                    for (const frame of read.frames) {
+                        if (frame.close !== undefined) closing = frame;
+                        else this.#deliver(frame.binary ? fromBase64(frame.data) : frame.data, origin);
+                    }
+                    if (read.done) {
+                        broken = !!read.error;
+                        break;
+                    }
+                }
+            } catch {
+                broken = true;
+            }
+            if (!closing) this.dispatchEvent(new Event("error"));
+            this.#closed(closing ? closing.close : 1006, closing ? closing.data : "", !!closing && !broken);
+        }
+
+        #deliver(data, origin) {
+            const payload = typeof data === "string"
+                ? data
+                : this.#binaryType === "arraybuffer" ? data.slice().buffer : new Blob([data]);
+            this.dispatchEvent(new MessageEvent("message", { data: payload, origin }));
+        }
+
+        send(data) {
+            if (this.#readyState === 0) {
+                throw new DOMException("Failed to execute 'send' on 'WebSocket': Still in CONNECTING state.", "InvalidStateError");
+            }
+            const size = byteSize(data);
+            if (this.#readyState !== 1) {
+                this.#buffered += size;
+                return;
+            }
+            if (this.#native) {
+                this.#native.send(data);
+                const id = this.#mirrorId;
+                if (id) frameOf(data, "sent", MAX_LOGGED).then((message) => tell("message", { id, message }));
+                return;
+            }
+            this.#buffered += size;
+            const id = this.#id;
+            // In order, whatever a Blob takes to read.
+            this.#sending = this.#sending.then(async () => {
+                const frame = await frameOf(data, "sent");
+                await call("wsSend", { id, data: frame.data, binary: !!frame.binary }).catch(() => { });
+                this.#buffered -= size;
+            });
+        }
+
+        close(code, reason) {
+            if (code !== undefined && code !== 1000 && !(code >= 3000 && code <= 4999)) {
+                throw new DOMException(`Failed to execute 'close' on 'WebSocket': The code must be 1000 or between 3000 and 4999. ${code} is neither.`, "InvalidAccessError");
+            }
+            if (reason !== undefined && new TextEncoder().encode(String(reason)).length > 123) {
+                throw new DOMException("Failed to execute 'close' on 'WebSocket': The close reason must not be greater than 123 UTF-8 bytes.", "SyntaxError");
+            }
+            if (this.#readyState >= 2) return;
+            if (this.#native) {
+                this.#readyState = 2;
+                this.#native.close(...arguments);
+                return;
+            }
+            if (this.#readyState === 0) {
+                // Still asking the engine: the connection fails once it answers.
+                this.#readyState = 2;
+                this.#closeAsked = true;
+                return;
+            }
+            this.#readyState = 2;
+            const id = this.#id;
+            const payload = { id, reason: reason === undefined ? "" : String(reason) };
+            if (code !== undefined) payload.code = code;
+            this.#sending = this.#sending.then(() => call("wsClose", payload).catch(() => { }));
+        }
+
+        #fail() {
+            this.#readyState = 3;
+            this.dispatchEvent(new Event("error"));
+            this.#closed(1006, "", false);
+        }
+
+        #closed(code, reason, wasClean) {
+            this.#readyState = 3;
+            this.dispatchEvent(new CloseEvent("close", { code, reason, wasClean }));
+        }
+    }
+    handlerProperties(WebSocket.prototype, ["open", "message", "error", "close"]);
+    keepInstanceof(WebSocket, NativeWebSocket);
+    window.WebSocket = WebSocket;
 })();

@@ -81,9 +81,18 @@
         });
     }
 
-    /** Fire and forget: what is only reported to the capture. */
+    /**
+     * Fire and forget: what is only reported to the capture. The engine runs calls side by side, so one
+     * stream's reports go one after another (an open overtaken by its close would log a failed request).
+     */
+    const reports = new Map(); // stream id -> its last report
     function tell(action, payload) {
-        call(action, payload).catch(() => { });
+        const id = payload.id;
+        const report = (reports.get(id) || Promise.resolve()).then(() => call(action, payload)).catch(() => { });
+        reports.set(id, report);
+        if (action === "close" || action === "cancel") {
+            report.then(() => { if (reports.get(id) === report) reports.delete(id); });
+        }
     }
 
     /** Whether a request to `url` goes through the engine, waiting briefly for the first state. */
@@ -164,7 +173,8 @@
             },
             async pull(c) {
                 for (;;) {
-                    const read = await call("read", { id });
+                    // The engine or the extension went away: a broken body, as the browser reports one.
+                    const read = await call("read", { id }).catch(() => ({ chunks: [], done: true, error: true }));
                     for (const chunk of read.chunks) c.enqueue(fromBase64(chunk));
                     if (read.done) {
                         signal?.removeEventListener("abort", abort);

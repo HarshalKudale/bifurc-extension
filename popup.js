@@ -30,7 +30,7 @@ let state = {
     connected: false,
     searching: true,
     notFound: false,
-    basePort: 9271,
+    basePort: 4747,
     scanAhead: 10,
     proxyEnabled: false,
     proxyActive: false,

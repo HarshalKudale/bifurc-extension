@@ -9,7 +9,7 @@
  * 3. The toggle routes browser traffic to that port, or leaves it direct.
  *
  * Finding the companion server: the app binds the first free port at or above
- * a base port (9271 unless changed in the app's Settings → Ports). So the
+ * a base port (4747 unless changed in the app's Settings → Ports). So the
  * extension tries the base port and the next 10 above it, lowest first. If
  * none answers, the popup offers the port to the user.
  *
@@ -24,7 +24,7 @@
 
 const HOST = "127.0.0.1";
 /** The app's default companion port (Settings → Ports). */
-const DEFAULT_BASE_PORT = 9271;
+const DEFAULT_BASE_PORT = 4747;
 /** How many ports above the base are tried before giving up. */
 const SCAN_AHEAD = 10;
 /** `PROTOCOL_VERSION` in `protocol-rust/src/version.rs`. */

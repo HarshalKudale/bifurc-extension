@@ -1,7 +1,7 @@
 {
     "manifest_version": 3,
     "name": "Bifurc Companion",
-    "version": "1.0.4",
+    "version": "1.1.0",
     "description": "Send browser traffic through the Bifurc desktop app's proxy",
     "permissions": [
         "proxy",

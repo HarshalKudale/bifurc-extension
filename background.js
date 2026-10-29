@@ -32,6 +32,8 @@ const DEFAULT_BASE_PORT = 4747;
 const SCAN_AHEAD = 10;
 /** `PROTOCOL_VERSION` in `protocol-rust/src/version.rs`. */
 const PROTOCOL_VERSION = "1.0.0";
+/** The first engine with the `browser.*` commands; pages stay native on an older one. */
+const MIN_BROWSER_ENGINE = [0, 6, 2];
 /** One of the engine's `CLIENT_NAMES`. */
 const CLIENT_NAME = "bifurc-extension";
 
@@ -387,9 +389,21 @@ function openSession(port, token) {
     });
 }
 
+/** Whether a version like "0.6.2" (or "0.6.2-beta.1", read as 0.6.2) is at least `min`. Unreadable is false. */
+function versionAtLeast(version, min) {
+    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(typeof version === "string" ? version.trim() : "");
+    if (!match) return false;
+    for (let i = 0; i < 3; i++) {
+        const part = Number(match[i + 1]);
+        if (part !== min[i]) return part > min[i];
+    }
+    return true;
+}
+
 async function sessionStarted(port) {
     notFound = false;
-    browserCommands = true;
+    browserCommands = versionAtLeast(engineVersion, MIN_BROWSER_ENGINE);
+    if (!browserCommands) console.log(`[Bifurc] Engine ${engineVersion || "(unknown)"} predates HTTPS routing; pages stay native`);
     retryDelay = 1000;
     if (retryTimer) clearTimeout(retryTimer);
     retryTimer = null;

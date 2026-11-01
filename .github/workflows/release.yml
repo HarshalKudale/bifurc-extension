@@ -1,0 +1,47 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without v; must equal manifest.json (e.g. 1.1.0)"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Check the version
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::bad version"; exit 1; }
+          [ "$(node -p 'require("./manifest.json").version')" = "$VERSION" ] || { echo "::error::manifest.json is not $VERSION"; exit 1; }
+          git ls-remote --exit-code --tags origin "refs/tags/ext-v$VERSION" && { echo "::error::tag exists"; exit 1; } || true
+      - name: Package
+        run: |
+          npm run package:chrome
+          npm run package:firefox
+      - name: Draft the release with both zips attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          gh release create "ext-v$VERSION" dist/*.zip --repo "$GITHUB_REPOSITORY" --draft \
+            --target "$GITHUB_SHA" --title "Bifurc Companion $VERSION" --generate-notes
+          echo "Draft ext-v$VERSION created. Upload the zips to the Chrome Web Store and Firefox AMO by hand, then publish." >> "$GITHUB_STEP_SUMMARY"

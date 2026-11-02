@@ -1,5 +1,5 @@
 # ===== Bifurc Companion — Chrome / Firefox MV3 extension =====
-# This repository holds the browser extension only. The Electron desktop app
+# This repository holds the browser extension only. The Rust desktop app
 # (`bifurc`) and the website (`bifurc-studio`) are separate repositories with
 # their own .gitignore files.
 #
@@ -66,7 +66,12 @@ Desktop.ini
 .cache/
 .eslintcache
 
-# ===== WorkBuddy agent artifacts =====
-# `.workbuddy-ai/preview/` is shared local-preview tooling and is intentionally
-# committed; agent memory/state is local only.
-.workbuddy-ai/memory/
+# ===== Tooling output and assistant artifacts =====
+.claude/
+CLAUDE.md
+graphify-out/
+*.xpi
+scripts/e2e/node_modules/
+.env.*
+!.env.example
+gitleaks-report*

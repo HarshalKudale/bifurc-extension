@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [master]
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      e2e:
+        description: "Also run the end-to-end test against the latest Bifurc Linux build"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Syntax-check every script
+        run: |
+          set -e
+          for f in $(git ls-files '*.js' '*.mjs'); do node --check "$f"; done
+      - name: Check manifest.json
+        run: |
+          node -e '
+            const m = JSON.parse(require("fs").readFileSync("manifest.json", "utf8"));
+            if (m.manifest_version !== 3) throw new Error("manifest_version must be 3");
+            if (!/^\d+\.\d+\.\d+$/.test(m.version)) throw new Error("bad version " + m.version);
+          '
+      - name: Lint the extension
+        run: npx --yes web-ext@8 lint --source-dir . --ignore-files "scripts/**" "dist/**" "node_modules/**"
+
+  secrets:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: gitleaks/gitleaks-action@ff98106e4c7b2bc287b24eaf42907196329070c7 # v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  workflow-guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Forks may not change CI or scripts without approval
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+        run: |
+          if git diff --name-only "$BASE" "$HEAD" | grep -E '^(\.github/|scripts/)'; then
+            echo "$LABELS" | grep -q '"ci-approved"' || { echo "::error::A maintainer must add the ci-approved label."; exit 1; }
+          fi
+      - name: Every job runs on a GitHub-hosted runner
+        run: "! grep -rn 'self-hoste[d]' .github/workflows/"
+
+  e2e:
+    if: github.event_name == 'workflow_dispatch' && inputs.e2e
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+      - name: Download the latest Bifurc Linux build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bifurc"
+          gh release download --repo HarshalKudale/bifurc --pattern '*-linux-*.tar.gz' --dir "$RUNNER_TEMP/bifurc"
+          tar -xzf "$RUNNER_TEMP"/bifurc/*.tar.gz -C "$RUNNER_TEMP/bifurc"
+      - name: Run the end-to-end test
+        working-directory: scripts/e2e
+        run: |
+          npm install
+          npx playwright-core install --with-deps chromium
+          BIFURC_BIN="$(dirname "$(find "$RUNNER_TEMP/bifurc" -name bifurc-engine | head -1)")" xvfb-run node run.mjs
+
+  all-green:
+    if: always()
+    needs: [lint, secrets, workflow-guard]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Every required job passed
+        env:
+          RESULTS: ${{ toJSON(needs.*.result) }}
+        run: "! echo \"$RESULTS\" | grep -Eq 'failure|cancelled'"

@@ -49,8 +49,8 @@ Set `BIFURC_BIN` to the folder with `bifurc-engine` and `bifurc` (see the header
 ## Support Bifurc
 
 Bifurc is free and maintained by one person.
-[Ko-fi](https://ko-fi.com/harshalkudale) (TODO(owner): confirm the page exists) and
-[GitHub Sponsors](https://github.com/sponsors/HarshalKudale) (TODO(owner): enable Sponsors). A star on the repo
+[Ko-fi](https://ko-fi.com/codewrath) and
+[GitHub Sponsors](https://github.com/sponsors/HarshalKudale). A star on the repo
 helps too.
 
 Contact: contact@bifurc.app
